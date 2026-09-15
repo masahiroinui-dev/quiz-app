@@ -60,7 +60,7 @@ else:
 
 st.markdown(bg_css, unsafe_allow_html=True)
 
-# 視認性CSS（入力フィールドの文字色を白に変更）
+# 視認性CSS（暗め透過背景 ＋ 白文字）
 st.markdown("""
     <style>
     .block-container {
@@ -81,11 +81,11 @@ st.markdown("""
         border-right: 1px solid rgba(255, 255, 255, 0.15);
     }
 
-    /* 入力フィールド全般の設定（背景はグレー半透明・文字色は鮮明な白） */
+    /* 入力フィールド：黒透過背景 ＋ 鮮明な白文字 */
     div[data-baseweb="input"] > div, div[data-baseweb="select"] > div {
-        background-color: rgba(50, 50, 65, 0.85) !important;
+        background-color: rgba(0, 0, 0, 0.65) !important;
         border-radius: 8px !important;
-        border: 2px solid rgba(255, 255, 255, 0.3) !important;
+        border: 1px solid rgba(255, 255, 255, 0.3) !important;
         box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5) !important;
     }
     input {
@@ -136,7 +136,7 @@ def safe_execute(query, retries=3, delay=0.5):
             time.sleep(delay)
 
 # --------------------------------------------------
-# クイズデータ読み込み
+# クイズデータ読み込み（IDを固定割り当て）
 # --------------------------------------------------
 @st.cache_data
 def get_quiz_data():
@@ -148,7 +148,7 @@ def get_quiz_data():
         except UnicodeDecodeError:
             df = pd.read_csv(csv_file, encoding="shift-jis")
             
-        df = df.sample(frac=1, random_state=None).reset_index(drop=True)
+        # CSVの行番号（1〜）を問題IDとして固定定義
         df["id"] = range(1, len(df) + 1)
         return df
     else:
@@ -221,7 +221,7 @@ if role == "👑 オーナー（管理者）":
                 "q_end_id": int(q_end)
             }, on_conflict="room_code"))
             safe_execute(supabase.table("players").delete().eq("room_code", room_code))
-            st.success(f"ルーム `{room_code}` と参加者データを初期化しました！（出題数: {q_end - q_start + 1} 問）")
+            st.success(f"ルーム `{room_code}` と参加者データを初期化しました！（開始ID: {q_start} / 終了ID: {q_end}）")
             
     with btn_col2:
         if st.button("🗑️ 参加者データのみクリア"):
@@ -236,15 +236,15 @@ if role == "👑 オーナー（管理者）":
     if room_res.data:
         room_data = room_res.data[0]
         current_status = room_data.get("status", "waiting")
-        current_q_id = room_data.get("current_question_id", q_start)
+        current_q_id = int(room_data.get("current_question_id", q_start))
         
         q_row = df_quiz[df_quiz["id"] == current_q_id]
         current_question = q_row.iloc[0]["question"] if not q_row.empty else "問題データがありません"
         current_answer = q_row.iloc[0]["answer"] if not q_row.empty else ""
         
-        st.markdown(f"**現在のステータス**: `{current_status}` | **現在出題中の問題**: 第 `{current_q_id}` 問")
+        st.markdown(f"**現在のステータス**: `{current_status}` | **現在出題中の問題番号**: 第 `{current_q_id}` 問")
         
-        # --- オーナー画面用の出題問題表示エリア ---
+        # オーナー用 出題テキストの表示エリア
         st.info(f"❓ **出題中の問題 (第 {current_q_id} 問):**\n\n### {current_question}\n\n💡 **正解:** **【 {current_answer} 】**")
         
         col_btn1, col_btn2, col_btn3 = st.columns(3)
@@ -262,7 +262,9 @@ if role == "👑 オーナー（管理者）":
         with col_btn3:
             if st.button("➡️ 次の問題へ"):
                 next_id = current_q_id + 1
-                if next_id > room_data.get("q_end_id", q_end):
+                max_end_id = int(room_data.get("q_end_id", q_end))
+                
+                if next_id > max_end_id:
                     safe_execute(supabase.table("rooms").update({"status": "finished"}).eq("room_code", room_code))
                 else:
                     safe_execute(supabase.table("players").update({"last_answer": ""}).eq("room_code", room_code))
@@ -358,7 +360,7 @@ else:
             
         room_data = room_res.data[0]
         status = room_data.get("status", "waiting")
-        current_q_id = room_data.get("current_question_id", 1)
+        current_q_id = int(room_data.get("current_question_id", 1))
         
         icon_html = render_icon_html(st.session_state.icon, 64)
         st.markdown(f"### {icon_html} **{st.session_state.player_name}** さんの画面 (ルーム: `{room_code}`)", unsafe_allow_html=True)
