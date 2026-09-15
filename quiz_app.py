@@ -4,6 +4,7 @@ import pandas as pd
 import time
 import base64
 import os
+import re
 
 # --------------------------------------------------
 # ページ設定
@@ -131,7 +132,7 @@ def safe_execute(query, retries=2, delay=0.2):
             time.sleep(delay)
 
 # --------------------------------------------------
-# クイズデータ読み込み
+# クイズデータ読み込み & 複数正解判定用関数
 # --------------------------------------------------
 @st.cache_data
 def get_quiz_data():
@@ -144,7 +145,6 @@ def get_quiz_data():
             df = pd.read_csv(csv_file, encoding="shift-jis")
             
         df["id"] = range(1, len(df) + 1)
-        # 空白除去
         df["answer"] = df["answer"].astype(str).str.strip()
         df["question"] = df["question"].astype(str).str.strip()
         return df
@@ -153,6 +153,18 @@ def get_quiz_data():
         st.stop()
 
 df_quiz = get_quiz_data()
+
+# スラッシュ(/や／)区切りの複数正解を判定する関数
+def check_is_correct(user_ans: str, raw_correct_ans: str) -> bool:
+    if not user_ans or not user_ans.strip():
+        return False
+    
+    clean_user = user_ans.strip().lower()
+    # / と ／ の両方で分割
+    answers = re.split(r'[/／]', str(raw_correct_ans))
+    valid_answers = [a.strip().lower() for a in answers if a.strip()]
+    
+    return clean_user in valid_answers
 
 # --------------------------------------------------
 # キャラアイコン読み込み
@@ -288,7 +300,7 @@ if role == "👑 オーナー（管理者）":
             def judge_answer(ans):
                 if not ans or str(ans).strip() == "":
                     return "-"
-                return "⭕ 正解" if str(ans).strip().lower() == str(current_answer).strip().lower() else "❌ 不正解"
+                return "⭕ 正解" if check_is_correct(str(ans), current_answer) else "❌ 不正解"
 
             df_players["判定"] = df_players["last_answer"].apply(judge_answer)
             
@@ -320,8 +332,10 @@ else:
         st.session_state.room_code = "ROOM1"
     if "icon" not in st.session_state:
         st.session_state.icon = list(available_icons.values())[0]
-    if "answered_q_id" not in st.session_state:
-        st.session_state.answered_q_id = None
+    if "last_processed_q" not in st.session_state:
+        st.session_state.last_processed_q = None
+    if "submitted" not in st.session_state:
+        st.session_state.submitted = False
         
     if not st.session_state.joined:
         st.subheader("参加情報の入力")
@@ -364,6 +378,11 @@ else:
         status = room_data.get("status", "waiting")
         current_q_id = int(room_data.get("current_question_id", 1))
         
+        # 新しい問題IDに切り替わったら送信フラグを自動リセット
+        if st.session_state.last_processed_q != current_q_id:
+            st.session_state.submitted = False
+            st.session_state.last_processed_q = current_q_id
+        
         icon_html = render_icon_html(st.session_state.icon, 64)
         st.markdown(f"### {icon_html} **{st.session_state.player_name}** さんの画面 (ルーム: `{room_code}`)", unsafe_allow_html=True)
         
@@ -381,15 +400,14 @@ else:
                 st.subheader(f"❓ 第 {current_q_id} 問")
                 st.markdown(f"#### {q_text}")
                 
-                # 問題が変わった場合、回答済状態を初期化
-                if st.session_state.answered_q_id != current_q_id:
-                    already_submitted = False
-                else:
-                    already_submitted = True
+                # 回答入力欄
+                user_input = st.text_input(
+                    "回答を入力してください",
+                    key=f"input_{current_q_id}",
+                    disabled=st.session_state.submitted
+                )
                 
-                user_input = st.text_input("回答を入力してください", key=f"input_q_{current_q_id}", disabled=already_submitted)
-                
-                if not already_submitted:
+                if not st.session_state.submitted:
                     if st.button("解答を送信", type="primary"):
                         if not user_input.strip():
                             st.error("回答を入力してください。")
@@ -400,8 +418,10 @@ else:
                                 current_score = p_data.get("score", 0)
                                 current_combo = p_data.get("combo", 0)
                                 
-                                # 完全一致判定（大文字小文字・前後空白無視）
-                                if user_input.strip().lower() == correct_ans.lower():
+                                # スラッシュ区切り対応の判定
+                                is_correct = check_is_correct(user_input, correct_ans)
+                                
+                                if is_correct:
                                     new_combo = current_combo + 1
                                     add_score = 100 + (new_combo - 1) * 20
                                     new_score = current_score + add_score
@@ -409,14 +429,13 @@ else:
                                     new_combo = 0
                                     new_score = current_score
                                     
-                                query = supabase.table("players").update({
+                                safe_execute(supabase.table("players").update({
                                     "score": new_score,
                                     "combo": new_combo,
                                     "last_answer": user_input.strip()
-                                }).eq("room_code", room_code).eq("player_name", st.session_state.player_name)
-                                safe_execute(query)
+                                }).eq("room_code", room_code).eq("player_name", st.session_state.player_name))
                                 
-                                st.session_state.answered_q_id = current_q_id
+                                st.session_state.submitted = True
                                 st.rerun()
                 else:
                     st.success("✅ 回答を送信しました！正答発表をお待ちください。")
@@ -436,7 +455,7 @@ else:
                     p = p_res.data[0]
                     user_ans = p.get("last_answer", "")
                     
-                    if user_ans.strip().lower() == str(correct_ans).strip().lower():
+                    if check_is_correct(user_ans, correct_ans):
                         st.balloons()
                         st.markdown(f"🎉 **正解！** あなたの回答: `{user_ans}`")
                     else:
@@ -470,5 +489,6 @@ else:
                 
             if st.button("最初に戻る"):
                 st.session_state.joined = False
-                st.session_state.answered_q_id = None
+                st.session_state.submitted = False
+                st.session_state.last_processed_q = None
                 st.rerun()
