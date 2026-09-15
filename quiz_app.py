@@ -234,14 +234,21 @@ if role == "👑 オーナー（管理者）":
             e_id = max(int(q_start), int(q_end))
             new_seed = int(time.time())
             
-            # DBに安全に保存可能な既存カラムのみを使用（q_start_idにシード値等をエンコード保存）
-            safe_execute(supabase.table("rooms").upsert({
+            # ルームが存在するか事前確認してInsert/Updateを振り分け
+            existing_room = safe_execute(supabase.table("rooms").select("room_code").eq("room_code", room_code)).data
+            
+            room_payload = {
                 "room_code": room_code,
                 "status": "waiting",
-                "current_question_id": 0, # インデックス0からスタート
+                "current_question_id": 0,
                 "q_start_id": s_id,
                 "q_end_id": e_id
-            }, on_conflict="room_code"))
+            }
+            
+            if existing_room:
+                safe_execute(supabase.table("rooms").update(room_payload).eq("room_code", room_code))
+            else:
+                safe_execute(supabase.table("rooms").insert(room_payload))
             
             st.session_state[f"shuffle_seed_{room_code}"] = new_seed
             safe_execute(supabase.table("players").delete().eq("room_code", room_code))
@@ -381,18 +388,30 @@ else:
             
         if st.button("🎮 参加する", type="primary"):
             p_name = st.session_state.player_name.strip()
+            r_code = st.session_state.room_code.strip()
+            
             if not p_name:
                 st.error("プレイヤー名を入力してください。")
             else:
-                query = supabase.table("players").upsert({
-                    "room_code": st.session_state.room_code,
+                # 既に登録済みのプレイヤーか事前確認（安全な重複・連打防止）
+                check_res = safe_execute(supabase.table("players").select("player_name").eq("room_code", r_code).eq("player_name", p_name))
+                
+                player_payload = {
+                    "room_code": r_code,
                     "player_name": p_name,
                     "icon": st.session_state.icon,
                     "score": 0,
                     "combo": 0,
                     "last_answer": ""
-                }, on_conflict="room_code, player_name")
-                safe_execute(query)
+                }
+                
+                if check_res.data:
+                    # すでに存在する場合は更新
+                    safe_execute(supabase.table("players").update(player_payload).eq("room_code", r_code).eq("player_name", p_name))
+                else:
+                    # 未存在の場合は新規登録
+                    safe_execute(supabase.table("players").insert(player_payload))
+                    
                 st.session_state.joined = True
                 st.rerun()
     else:
