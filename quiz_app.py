@@ -60,7 +60,7 @@ else:
 
 st.markdown(bg_css, unsafe_allow_html=True)
 
-# 視認性CSS（ダーク透過＋高透過率＋白文字）
+# 視認性CSS（文字入力フィールド内部をはっきり見える黒文字に変更）
 st.markdown("""
     <style>
     .block-container {
@@ -81,31 +81,15 @@ st.markdown("""
         border-right: 1px solid rgba(255, 255, 255, 0.15);
     }
 
-    /* 入力フィールド全般（ダーク透過化強固指定） */
-    div[data-baseweb="input"],
-    div[data-baseweb="input"] > div,
-    div[data-baseweb="base-input"],
-    div[data-baseweb="select"],
-    div[data-baseweb="select"] > div {
-        background-color: rgba(15, 18, 30, 0.75) !important;
-        border-radius: 8px !important;
-        border: 1px solid rgba(255, 255, 255, 0.4) !important;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6) !important;
-    }
-
-    input, select, textarea, div[data-baseweb="select"] span {
-        color: #ffffff !important;
-        -webkit-text-fill-color: #ffffff !important;
+    /* --- 入力フィールド内の文字色を「黒」に強制設定 --- */
+    input, select, textarea {
+        color: #000000 !important;
+        -webkit-text-fill-color: #000000 !important;
         text-shadow: none !important;
         font-weight: bold !important;
-        background-color: transparent !important;
     }
 
-    button[aria-label="Increase value"], button[aria-label="Decrease value"] {
-        background-color: transparent !important;
-        color: #ffffff !important;
-    }
-
+    /* ボタン類 */
     button[kind="primary"] {
         background-color: #00d2ff !important;
         color: #000000 !important;
@@ -255,8 +239,11 @@ if role == "👑 オーナー（管理者）":
         
         st.markdown(f"**現在のステータス**: `{current_status}` | **現在出題中の問題番号**: 第 `{current_q_id}` 問")
         
-        # オーナー用 出題テキストの表示エリア
-        st.info(f"❓ **出題中の問題 (第 {current_q_id} 問):**\n\n### {current_question}\n\n💡 **正解:** **【 {current_answer} 】**")
+        # オーナー用 出題テキストの表示エリア（出題中は正解を隠し、正答発表時のみ表示）
+        if current_status == "answer":
+            st.info(f"❓ **出題中の問題 (第 {current_q_id} 問):**\n\n### {current_question}\n\n💡 **正解:** **【 {current_answer} 】**")
+        else:
+            st.info(f"❓ **出題中の問題 (第 {current_q_id} 問):**\n\n### {current_question}\n\n🔒 *(正解は「正答発表」を押すと表示されます)*")
         
         col_btn1, col_btn2, col_btn3 = st.columns(3)
         with col_btn1:
@@ -314,7 +301,7 @@ if role == "👑 オーナー（管理者）":
         else:
             st.info("現在参加者はいません。")
             
-    time.sleep(1)  # 待ち時間を1秒に短縮
+    time.sleep(1)
     st.rerun()
 
 # --------------------------------------------------
@@ -416,7 +403,7 @@ else:
                         }).eq("room_code", room_code).eq("player_name", st.session_state.player_name)
                         safe_execute(query)
             
-            time.sleep(1)  # 待ち時間を1秒に短縮
+            time.sleep(1)
             st.rerun()
             
         elif status == "answer":
@@ -431,7 +418,7 @@ else:
                     p = p_res.data[0]
                     st.markdown(f"現在のスコア: **{p.get('score', 0)} pt** | コンボ: **{p.get('combo', 0)}**")
             
-            time.sleep(1)  # 待ち時間を1秒に短縮
+            time.sleep(1)
             st.rerun()
             
         elif status == "finished":
