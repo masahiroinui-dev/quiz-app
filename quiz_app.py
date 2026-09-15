@@ -61,7 +61,7 @@ else:
 
 st.markdown(bg_css, unsafe_allow_html=True)
 
-# 視認性CSS（文字入力フィールド内部を黒文字指定）
+# 視認性CSS
 st.markdown("""
     <style>
     .block-container {
@@ -82,7 +82,6 @@ st.markdown("""
         border-right: 1px solid rgba(255, 255, 255, 0.15);
     }
 
-    /* 入力フィールドのテキスト色（黒） */
     input, select, textarea {
         color: #000000 !important;
         -webkit-text-fill-color: #000000 !important;
@@ -132,21 +131,23 @@ def safe_execute(query, retries=2, delay=0.2):
             time.sleep(delay)
 
 # --------------------------------------------------
-# クイズデータ読み込み（ランダムシャッフル機能付き）
+# クイズデータ読み込み（CSVの「id」列または行番号をID化）
 # --------------------------------------------------
 @st.cache_data
-def get_quiz_data(seed: int = 42):
+def get_raw_quiz_data():
     csv_file = "questions.csv"
-    
     if os.path.exists(csv_file):
         try:
             df = pd.read_csv(csv_file, encoding="utf-8")
         except UnicodeDecodeError:
             df = pd.read_csv(csv_file, encoding="shift-jis")
             
-        # ランダムに並び替え（シャッフル）
-        df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
-        df["id"] = range(1, len(df) + 1)
+        # CSV内に「id」列があればそれを数値化、無ければ1からの連番にする
+        if "id" in df.columns:
+            df["q_id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
+        else:
+            df["q_id"] = range(1, len(df) + 1)
+            
         df["answer"] = df["answer"].astype(str).str.strip()
         df["question"] = df["question"].astype(str).str.strip()
         return df
@@ -154,22 +155,15 @@ def get_quiz_data(seed: int = 42):
         st.error(f"クイズファイル `{csv_file}` が見つかりません。")
         st.stop()
 
-# シャッフルシード用のセッションステート
-if "shuffle_seed" not in st.session_state:
-    st.session_state.shuffle_seed = 42
-
-df_quiz = get_quiz_data(st.session_state.shuffle_seed)
+df_raw_quiz = get_raw_quiz_data()
 
 # スラッシュ(/や／)区切りの複数正解を判定する関数
 def check_is_correct(user_ans: str, raw_correct_ans: str) -> bool:
     if not user_ans or not user_ans.strip():
         return False
-    
     clean_user = user_ans.strip().lower()
-    # / と ／ の両方で分割
     answers = re.split(r'[/／]', str(raw_correct_ans))
     valid_answers = [a.strip().lower() for a in answers if a.strip()]
-    
     return clean_user in valid_answers
 
 # --------------------------------------------------
@@ -200,6 +194,9 @@ def render_icon_html(icon_value: str, size: int = 70) -> str:
 st.sidebar.title("🎮 クイズシステム")
 role = st.sidebar.radio("役割を選択してください", ["👤 プレイヤー（参加者）", "👑 オーナー（管理者）"])
 
+min_q_id = int(df_raw_quiz["q_id"].min())
+max_q_id = int(df_raw_quiz["q_id"].max())
+
 # --------------------------------------------------
 # オーナー（管理者）画面
 # --------------------------------------------------
@@ -220,33 +217,39 @@ if role == "👑 オーナー（管理者）":
     with col1:
         room_code = st.text_input("ルームコード", value="ROOM1")
     with col2:
-        q_start = st.number_input("開始問題ID", min_value=1, max_value=len(df_quiz), value=1)
+        q_start = st.number_input("開始問題ID", min_value=min_q_id, max_value=max_q_id, value=min_q_id)
     with col3:
-        q_end = st.number_input("終了問題ID", min_value=1, max_value=len(df_quiz), value=len(df_quiz))
+        q_end = st.number_input("終了問題ID", min_value=min_q_id, max_value=max_q_id, value=min_q_id + 9 if min_q_id + 9 <= max_q_id else max_q_id)
         
-    btn_col1, btn_col2, btn_col3 = st.columns([2, 1, 1])
+    btn_col1, btn_col2 = st.columns([2, 1])
     with btn_col1:
-        if st.button("🚀 ルームを作成 / 初期化する（参加者データも消去）", type="primary"):
-            st.cache_data.clear()
-            safe_execute(supabase.table("rooms").upsert({
-                "room_code": room_code,
-                "status": "waiting",
-                "current_question_id": int(q_start),
-                "q_start_id": int(q_start),
-                "q_end_id": int(q_end)
-            }, on_conflict="room_code"))
-            safe_execute(supabase.table("players").delete().eq("room_code", room_code))
-            st.success(f"ルーム `{room_code}` を待機状態で初期化しました！（開始ID: {q_start} / 終了ID: {q_end}）")
-            st.rerun()
+        if st.button("🚀 ルームを作成 / 初期化する（指定範囲でシャッフル）", type="primary"):
+            s_id = min(int(q_start), int(q_end))
+            e_id = max(int(q_start), int(q_end))
+            
+            # 指定されたIDの範囲内のみを正確に抽出
+            sub_df = df_raw_quiz[(df_raw_quiz["q_id"] >= s_id) & (df_raw_quiz["q_id"] <= e_id)]
+            
+            if sub_df.empty:
+                st.error("指定された範囲に該当する問題IDが存在しません。")
+            else:
+                # 抽出した問題IDだけをシャッフル
+                shuffled_ids = sub_df.sample(frac=1)["q_id"].tolist()
+                
+                safe_execute(supabase.table("rooms").upsert({
+                    "room_code": room_code,
+                    "status": "waiting",
+                    "current_question_id": 0, # インデックス0からスタート
+                    "q_start_id": s_id,
+                    "q_end_id": e_id,
+                    "question_order": shuffled_ids
+                }, on_conflict="room_code"))
+                
+                safe_execute(supabase.table("players").delete().eq("room_code", room_code))
+                st.success(f"ルーム `{room_code}` を初期化しました！ 問題ID {s_id}〜{e_id} の全 {len(shuffled_ids)} 問をシャッフルしました。")
+                st.rerun()
 
     with btn_col2:
-        if st.button("🔀 問題をランダム再配置"):
-            st.session_state.shuffle_seed = int(time.time())
-            st.cache_data.clear()
-            st.success("問題の出題順を再シャッフルしました！")
-            st.rerun()
-
-    with btn_col3:
         if st.button("🗑️ 参加者データのみクリア"):
             safe_execute(supabase.table("players").delete().eq("room_code", room_code))
             st.success("参加者データをクリアしました。")
@@ -259,20 +262,37 @@ if role == "👑 オーナー（管理者）":
     if room_res.data:
         room_data = room_res.data[0]
         current_status = room_data.get("status", "waiting")
-        current_q_id = int(room_data.get("current_question_id", q_start))
+        current_idx = int(room_data.get("current_question_id", 0))
         
-        q_row = df_quiz[df_quiz["id"] == current_q_id]
-        current_question = q_row.iloc[0]["question"] if not q_row.empty else "問題データがありません"
-        current_answer = q_row.iloc[0]["answer"] if not q_row.empty else ""
+        s_id = room_data.get("q_start_id", min_q_id)
+        e_id = room_data.get("q_end_id", max_q_id)
         
-        st.markdown(f"**現在のステータス**: `{current_status}` | **出題中の問題番号**: 第 `{current_q_id}` 問")
+        # シャッフルリストが取得できない場合の安全フォールバック処理
+        question_order = room_data.get("question_order")
+        if not question_order or not isinstance(question_order, list):
+            sub_df = df_raw_quiz[(df_raw_quiz["q_id"] >= s_id) & (df_raw_quiz["q_id"] <= e_id)]
+            question_order = sub_df["q_id"].tolist()
+            
+        total_q = len(question_order)
+        
+        if total_q > 0 and current_idx < total_q:
+            real_q_id = question_order[current_idx]
+            q_row = df_raw_quiz[df_raw_quiz["q_id"] == real_q_id]
+            current_question = q_row.iloc[0]["question"] if not q_row.empty else ""
+            current_answer = q_row.iloc[0]["answer"] if not q_row.empty else ""
+        else:
+            real_q_id = "-"
+            current_question = "出題可能な問題がありません"
+            current_answer = ""
+        
+        st.markdown(f"**ステータス**: `{current_status}` | **進行状況**: {current_idx + 1} / {total_q} 問目 (出題中の問題ID: `{real_q_id}`)")
         
         if current_status == "waiting":
-            st.warning("⏳ 参加者待機中です。「📢 クイズを出題（進行中）」を押すとプレイヤーに第1問が表示されます。")
+            st.warning("⏳ 参加者待機中です。「📢 クイズを出題」を押すとプレイヤー画面に出題されます。")
         elif current_status == "answer":
-            st.info(f"❓ **出題中の問題 (第 {current_q_id} 問):**\n\n### {current_question}\n\n💡 **正解:** **【 {current_answer} 】**")
+            st.info(f"❓ **現在の問題 ({current_idx + 1}/{total_q}問目):**\n\n### {current_question}\n\n💡 **正解:** **【 {current_answer} 】**")
         else:
-            st.info(f"❓ **出題中の問題 (第 {current_q_id} 問):**\n\n### {current_question}\n\n🔒 *(正解は「正答発表」を押すと表示されます)*")
+            st.info(f"❓ **現在の問題 ({current_idx + 1}/{total_q}問目):**\n\n### {current_question}\n\n🔒 *(正解は「正答発表」を押すと表示されます)*")
         
         col_btn1, col_btn2, col_btn3 = st.columns(3)
         with col_btn1:
@@ -288,16 +308,14 @@ if role == "👑 オーナー（管理者）":
                 
         with col_btn3:
             if st.button("➡️ 次の問題へ"):
-                next_id = current_q_id + 1
-                max_end_id = int(room_data.get("q_end_id", q_end))
-                
-                if next_id > max_end_id:
+                next_idx = current_idx + 1
+                if next_idx >= total_q:
                     safe_execute(supabase.table("rooms").update({"status": "finished"}).eq("room_code", room_code))
                 else:
                     safe_execute(supabase.table("players").update({"last_answer": ""}).eq("room_code", room_code))
                     safe_execute(supabase.table("rooms").update({
                         "status": "question",
-                        "current_question_id": next_id
+                        "current_question_id": next_idx
                     }).eq("room_code", room_code))
                 st.rerun()
                 
@@ -347,8 +365,8 @@ else:
         st.session_state.room_code = "ROOM1"
     if "icon" not in st.session_state:
         st.session_state.icon = list(available_icons.values())[0]
-    if "last_processed_q" not in st.session_state:
-        st.session_state.last_processed_q = None
+    if "last_processed_idx" not in st.session_state:
+        st.session_state.last_processed_idx = None
     if "submitted" not in st.session_state:
         st.session_state.submitted = False
         
@@ -364,23 +382,24 @@ else:
             st.markdown(f"選択中: {render_icon_html(st.session_state.icon, 80)}", unsafe_allow_html=True)
             
         if st.button("🎮 参加する", type="primary"):
-            if not st.session_state.player_name.strip():
+            p_name = st.session_state.player_name.strip()
+            if not p_name:
                 st.error("プレイヤー名を入力してください。")
             else:
-                query = supabase.table("players").insert({
+                query = supabase.table("players").upsert({
                     "room_code": st.session_state.room_code,
-                    "player_name": st.session_state.player_name,
+                    "player_name": p_name,
                     "icon": st.session_state.icon,
                     "score": 0,
                     "combo": 0,
                     "last_answer": ""
-                })
+                }, on_conflict="room_code, player_name")
                 safe_execute(query)
                 st.session_state.joined = True
                 st.rerun()
     else:
         room_code = st.session_state.room_code
-        room_res = safe_execute(supabase.table("rooms").select("status, current_question_id").eq("room_code", room_code))
+        room_res = safe_execute(supabase.table("rooms").select("*").eq("room_code", room_code))
         
         if not room_res.data:
             st.error("指定されたルームコードが存在しません。")
@@ -391,12 +410,19 @@ else:
             
         room_data = room_res.data[0]
         status = room_data.get("status", "waiting")
-        current_q_id = int(room_data.get("current_question_id", 1))
+        current_idx = int(room_data.get("current_question_id", 0))
         
-        # 新しい問題IDに切り替わったら送信フラグを自動リセット
-        if st.session_state.last_processed_q != current_q_id:
+        s_id = room_data.get("q_start_id", min_q_id)
+        e_id = room_data.get("q_end_id", max_q_id)
+        
+        question_order = room_data.get("question_order")
+        if not question_order or not isinstance(question_order, list):
+            sub_df = df_raw_quiz[(df_raw_quiz["q_id"] >= s_id) & (df_raw_quiz["q_id"] <= e_id)]
+            question_order = sub_df["q_id"].tolist()
+        
+        if st.session_state.last_processed_idx != current_idx:
             st.session_state.submitted = False
-            st.session_state.last_processed_q = current_q_id
+            st.session_state.last_processed_idx = current_idx
         
         icon_html = render_icon_html(st.session_state.icon, 64)
         st.markdown(f"### {icon_html} **{st.session_state.player_name}** さんの画面 (ルーム: `{room_code}`)", unsafe_allow_html=True)
@@ -407,76 +433,80 @@ else:
             st.rerun()
             
         elif status == "question":
-            q_row = df_quiz[df_quiz["id"] == current_q_id]
-            if not q_row.empty:
-                q_text = q_row.iloc[0]["question"]
-                correct_ans = str(q_row.iloc[0]["answer"]).strip()
+            if question_order and current_idx < len(question_order):
+                real_q_id = question_order[current_idx]
+                q_row = df_raw_quiz[df_raw_quiz["q_id"] == real_q_id]
                 
-                st.subheader(f"❓ 第 {current_q_id} 問")
-                st.markdown(f"#### {q_text}")
-                
-                # 回答入力欄
-                user_input = st.text_input(
-                    "回答を入力してください",
-                    key=f"input_{current_q_id}",
-                    disabled=st.session_state.submitted
-                )
-                
-                if not st.session_state.submitted:
-                    if st.button("解答を送信", type="primary"):
-                        if not user_input.strip():
-                            st.error("回答を入力してください。")
-                        else:
-                            p_res = safe_execute(supabase.table("players").select("score, combo").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
-                            if p_res.data:
-                                p_data = p_res.data[0]
-                                current_score = p_data.get("score", 0)
-                                current_combo = p_data.get("combo", 0)
-                                
-                                # スラッシュ区切り対応の判定
-                                is_correct = check_is_correct(user_input, correct_ans)
-                                
-                                if is_correct:
-                                    new_combo = current_combo + 1
-                                    add_score = 100 + (new_combo - 1) * 20
-                                    new_score = current_score + add_score
-                                else:
-                                    new_combo = 0
-                                    new_score = current_score
+                if not q_row.empty:
+                    q_text = q_row.iloc[0]["question"]
+                    correct_ans = str(q_row.iloc[0]["answer"]).strip()
+                    
+                    st.subheader(f"❓ 第 {current_idx + 1} 問")
+                    st.markdown(f"#### {q_text}")
+                    
+                    user_input = st.text_input(
+                        "回答を入力してください",
+                        key=f"input_{current_idx}",
+                        disabled=st.session_state.submitted
+                    )
+                    
+                    if not st.session_state.submitted:
+                        if st.button("解答を送信", type="primary"):
+                            if not user_input.strip():
+                                st.error("回答を入力してください。")
+                            else:
+                                p_res = safe_execute(supabase.table("players").select("score, combo").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
+                                if p_res.data:
+                                    p_data = p_res.data[0]
+                                    current_score = p_data.get("score", 0)
+                                    current_combo = p_data.get("combo", 0)
                                     
-                                safe_execute(supabase.table("players").update({
-                                    "score": new_score,
-                                    "combo": new_combo,
-                                    "last_answer": user_input.strip()
-                                }).eq("room_code", room_code).eq("player_name", st.session_state.player_name))
-                                
-                                st.session_state.submitted = True
-                                st.rerun()
-                else:
-                    st.success("✅ 回答を送信しました！正答発表をお待ちください。")
+                                    is_correct = check_is_correct(user_input, correct_ans)
+                                    
+                                    if is_correct:
+                                        new_combo = current_combo + 1
+                                        add_score = 100 + (new_combo - 1) * 20
+                                        new_score = current_score + add_score
+                                    else:
+                                        new_combo = 0
+                                        new_score = current_score
+                                        
+                                    safe_execute(supabase.table("players").update({
+                                        "score": new_score,
+                                        "combo": new_combo,
+                                        "last_answer": user_input.strip()
+                                    }).eq("room_code", room_code).eq("player_name", st.session_state.player_name))
+                                    
+                                    st.session_state.submitted = True
+                                    st.rerun()
+                    else:
+                        st.success("✅ 回答を送信しました！正答発表をお待ちください。")
             
             time.sleep(1)
             st.rerun()
             
         elif status == "answer":
-            q_row = df_quiz[df_quiz["id"] == current_q_id]
-            if not q_row.empty:
-                correct_ans = q_row.iloc[0]["answer"]
-                st.subheader(f"⭕ 第 {current_q_id} 問 の正解発表")
-                st.success(f"正解は **【 {correct_ans} 】** でした！")
+            if question_order and current_idx < len(question_order):
+                real_q_id = question_order[current_idx]
+                q_row = df_raw_quiz[df_raw_quiz["q_id"] == real_q_id]
                 
-                p_res = safe_execute(supabase.table("players").select("score, combo, last_answer").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
-                if p_res.data:
-                    p = p_res.data[0]
-                    user_ans = p.get("last_answer", "")
+                if not q_row.empty:
+                    correct_ans = q_row.iloc[0]["answer"]
+                    st.subheader(f"⭕ 第 {current_idx + 1} 問 の正解発表")
+                    st.success(f"正解は **【 {correct_ans} 】** でした！")
                     
-                    if check_is_correct(user_ans, correct_ans):
-                        st.balloons()
-                        st.markdown(f"🎉 **正解！** あなたの回答: `{user_ans}`")
-                    else:
-                        st.markdown(f"❌ **不正解...** あなたの回答: `{user_ans if user_ans else '未回答'}`")
+                    p_res = safe_execute(supabase.table("players").select("score, combo, last_answer").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
+                    if p_res.data:
+                        p = p_res.data[0]
+                        user_ans = p.get("last_answer", "")
                         
-                    st.markdown(f"現在のスコア: **{p.get('score', 0)} pt** | コンボ: **{p.get('combo', 0)}**")
+                        if check_is_correct(user_ans, correct_ans):
+                            st.balloons()
+                            st.markdown(f"🎉 **正解！** あなたの回答: `{user_ans}`")
+                        else:
+                            st.markdown(f"❌ **不正解...** あなたの回答: `{user_ans if user_ans else '未回答'}`")
+                            
+                        st.markdown(f"現在のスコア: **{p.get('score', 0)} pt** | コンボ: **{p.get('combo', 0)}**")
             
             time.sleep(1)
             st.rerun()
@@ -505,5 +535,5 @@ else:
             if st.button("最初に戻る"):
                 st.session_state.joined = False
                 st.session_state.submitted = False
-                st.session_state.last_processed_q = None
+                st.session_state.last_processed_idx = None
                 st.rerun()
