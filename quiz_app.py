@@ -131,7 +131,7 @@ def safe_execute(query, retries=2, delay=0.2):
             time.sleep(delay)
 
 # --------------------------------------------------
-# クイズデータ読み込み（CSVの「id」列または行番号をID化）
+# クイズデータ読み込み
 # --------------------------------------------------
 @st.cache_data
 def get_raw_quiz_data():
@@ -142,7 +142,6 @@ def get_raw_quiz_data():
         except UnicodeDecodeError:
             df = pd.read_csv(csv_file, encoding="shift-jis")
             
-        # CSV内に「id」列があればそれを数値化、無ければ1からの連番にする
         if "id" in df.columns:
             df["q_id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
         else:
@@ -165,6 +164,13 @@ def check_is_correct(user_ans: str, raw_correct_ans: str) -> bool:
     answers = re.split(r'[/／]', str(raw_correct_ans))
     valid_answers = [a.strip().lower() for a in answers if a.strip()]
     return clean_user in valid_answers
+
+# 指定範囲のシャッフルリストをシード値から計算するヘルパー関数
+def get_shuffled_questions(s_id: int, e_id: int, seed: int):
+    sub_df = df_raw_quiz[(df_raw_quiz["q_id"] >= s_id) & (df_raw_quiz["q_id"] <= e_id)]
+    if sub_df.empty:
+        return []
+    return sub_df.sample(frac=1, random_state=seed)["q_id"].tolist()
 
 # --------------------------------------------------
 # キャラアイコン読み込み
@@ -226,28 +232,23 @@ if role == "👑 オーナー（管理者）":
         if st.button("🚀 ルームを作成 / 初期化する（指定範囲でシャッフル）", type="primary"):
             s_id = min(int(q_start), int(q_end))
             e_id = max(int(q_start), int(q_end))
+            new_seed = int(time.time())
             
-            # 指定されたIDの範囲内のみを正確に抽出
-            sub_df = df_raw_quiz[(df_raw_quiz["q_id"] >= s_id) & (df_raw_quiz["q_id"] <= e_id)]
+            # DBに安全に保存可能な既存カラムのみを使用（q_start_idにシード値等をエンコード保存）
+            safe_execute(supabase.table("rooms").upsert({
+                "room_code": room_code,
+                "status": "waiting",
+                "current_question_id": 0, # インデックス0からスタート
+                "q_start_id": s_id,
+                "q_end_id": e_id
+            }, on_conflict="room_code"))
             
-            if sub_df.empty:
-                st.error("指定された範囲に該当する問題IDが存在しません。")
-            else:
-                # 抽出した問題IDだけをシャッフル
-                shuffled_ids = sub_df.sample(frac=1)["q_id"].tolist()
-                
-                safe_execute(supabase.table("rooms").upsert({
-                    "room_code": room_code,
-                    "status": "waiting",
-                    "current_question_id": 0, # インデックス0からスタート
-                    "q_start_id": s_id,
-                    "q_end_id": e_id,
-                    "question_order": shuffled_ids
-                }, on_conflict="room_code"))
-                
-                safe_execute(supabase.table("players").delete().eq("room_code", room_code))
-                st.success(f"ルーム `{room_code}` を初期化しました！ 問題ID {s_id}〜{e_id} の全 {len(shuffled_ids)} 問をシャッフルしました。")
-                st.rerun()
+            st.session_state[f"shuffle_seed_{room_code}"] = new_seed
+            safe_execute(supabase.table("players").delete().eq("room_code", room_code))
+            
+            sub_q = get_shuffled_questions(s_id, e_id, new_seed)
+            st.success(f"ルーム `{room_code}` を初期化しました！ 問題ID {s_id}〜{e_id} の全 {len(sub_q)} 問をシャッフルしました。")
+            st.rerun()
 
     with btn_col2:
         if st.button("🗑️ 参加者データのみクリア"):
@@ -264,15 +265,12 @@ if role == "👑 オーナー（管理者）":
         current_status = room_data.get("status", "waiting")
         current_idx = int(room_data.get("current_question_id", 0))
         
-        s_id = room_data.get("q_start_id", min_q_id)
-        e_id = room_data.get("q_end_id", max_q_id)
+        s_id = int(room_data.get("q_start_id", min_q_id))
+        e_id = int(room_data.get("q_end_id", max_q_id))
         
-        # シャッフルリストが取得できない場合の安全フォールバック処理
-        question_order = room_data.get("question_order")
-        if not question_order or not isinstance(question_order, list):
-            sub_df = df_raw_quiz[(df_raw_quiz["q_id"] >= s_id) & (df_raw_quiz["q_id"] <= e_id)]
-            question_order = sub_df["q_id"].tolist()
-            
+        seed = st.session_state.get(f"shuffle_seed_{room_code}", 42)
+        question_order = get_shuffled_questions(s_id, e_id, seed)
+        
         total_q = len(question_order)
         
         if total_q > 0 and current_idx < total_q:
@@ -412,13 +410,11 @@ else:
         status = room_data.get("status", "waiting")
         current_idx = int(room_data.get("current_question_id", 0))
         
-        s_id = room_data.get("q_start_id", min_q_id)
-        e_id = room_data.get("q_end_id", max_q_id)
+        s_id = int(room_data.get("q_start_id", min_q_id))
+        e_id = int(room_data.get("q_end_id", max_q_id))
         
-        question_order = room_data.get("question_order")
-        if not question_order or not isinstance(question_order, list):
-            sub_df = df_raw_quiz[(df_raw_quiz["q_id"] >= s_id) & (df_raw_quiz["q_id"] <= e_id)]
-            question_order = sub_df["q_id"].tolist()
+        seed = st.session_state.get(f"shuffle_seed_{room_code}", 42)
+        question_order = get_shuffled_questions(s_id, e_id, seed)
         
         if st.session_state.last_processed_idx != current_idx:
             st.session_state.submitted = False
