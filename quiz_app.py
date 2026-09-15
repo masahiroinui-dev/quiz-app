@@ -20,14 +20,25 @@ def get_base64_image(image_path: str) -> str:
     return ""
 
 # --------------------------------------------------
-# 背景画像 & スタイル設定 (背景活かし仕様)
+# 背景画像 & スタイル設定 (大文字・小文字・複数拡張子対応)
 # --------------------------------------------------
-bg_file = "bg.png" if os.path.exists("bg.png") else ("bg.jpg" if os.path.exists("bg.jpg") else None)
-bg_css = ""
+bg_file = None
+bg_candidates = [
+    "bg.png", "bg.jpg", "bg.jpeg", "bg.webp",
+    "BG.png", "BG.jpg", "BG.jpeg", "BG.webp",
+    "Bg.png", "Bg.jpg"
+]
+
+for cand in bg_candidates:
+    if os.path.exists(cand):
+        bg_file = cand
+        break
 
 if bg_file:
     bg_b64 = get_base64_image(bg_file)
-    ext = bg_file.split(".")[-1]
+    ext = bg_file.split(".")[-1].lower()
+    if ext == "jpg":
+        ext = "jpeg"
     bg_css = f"""
     <style>
     .stApp {{
@@ -49,7 +60,7 @@ else:
 
 st.markdown(bg_css, unsafe_allow_html=True)
 
-# 背景のイラストを生かすスタイリッシュな視認性CSS
+# 視認性CSS（入力フィールドの文字色を白に変更）
 st.markdown("""
     <style>
     .block-container {
@@ -70,14 +81,15 @@ st.markdown("""
         border-right: 1px solid rgba(255, 255, 255, 0.15);
     }
 
+    /* 入力フィールド全般の設定（背景はグレー半透明・文字色は鮮明な白） */
     div[data-baseweb="input"] > div, div[data-baseweb="select"] > div {
-        background-color: rgba(255, 255, 255, 0.95) !important;
+        background-color: rgba(50, 50, 65, 0.85) !important;
         border-radius: 8px !important;
-        border: 2px solid rgba(0, 0, 0, 0.3) !important;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3) !important;
+        border: 2px solid rgba(255, 255, 255, 0.3) !important;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5) !important;
     }
     input {
-        color: #111111 !important;
+        color: #ffffff !important;
         text-shadow: none !important;
         font-weight: bold !important;
     }
@@ -100,7 +112,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --------------------------------------------------
-# Supabase 初期化 (ソケットエラー対策リトライ機構付き)
+# Supabase 初期化
 # --------------------------------------------------
 @st.cache_resource
 def init_supabase() -> Client:
@@ -114,7 +126,6 @@ except Exception as e:
     st.error("Supabaseへの接続に失敗しました。.streamlit/secrets.toml の設定を確認してください。")
     st.stop()
 
-# ネットワーク通信用セーフ実行リトライ関数
 def safe_execute(query, retries=3, delay=0.5):
     for i in range(retries):
         try:
@@ -125,7 +136,7 @@ def safe_execute(query, retries=3, delay=0.5):
             time.sleep(delay)
 
 # --------------------------------------------------
-# questions.csv からクイズデータを読み込み＆ランダム順設定
+# クイズデータ読み込み
 # --------------------------------------------------
 @st.cache_data
 def get_quiz_data():
@@ -141,32 +152,29 @@ def get_quiz_data():
         df["id"] = range(1, len(df) + 1)
         return df
     else:
-        st.error(f"クイズファイル `{csv_file}` が見つかりません。作業フォルダ内に `questions.csv` を配置してください。")
+        st.error(f"クイズファイル `{csv_file}` が見つかりません。")
         st.stop()
 
 df_quiz = get_quiz_data()
 
 # --------------------------------------------------
-# キャラアイコンの自動読み込み
+# キャラアイコン読み込み
 # --------------------------------------------------
 available_icons = {}
-
 valid_extensions = (".png", ".jpg", ".jpeg", ".webp")
 for filename in sorted(os.listdir(".")):
     if filename.lower().endswith(valid_extensions) and not filename.lower().startswith("bg"):
         display_name = os.path.splitext(filename)[0]
         b64 = get_base64_image(filename)
-        ext = filename.split(".")[-1]
+        ext = filename.split(".")[-1].lower()
+        if ext == "jpg":
+            ext = "jpeg"
         available_icons[display_name] = f"data:image/{ext};base64,{b64}"
 
 if not available_icons:
     available_icons = {"キャラ01": "🐶", "キャラ02": "🐱", "キャラ03": "🦊", "キャラ04": "🤖"}
 
 def render_icon_html(icon_value: str, size: int = 70) -> str:
-    """
-    丸枠（border-radius: 50%）を維持したまま、
-    内側に少しパディングを設け object-fit: contain にすることで絵が切れずに丸枠内に大きく納まるように調整
-    """
     if icon_value.startswith("data:image"):
         return f'<img src="{icon_value}" width="{size}" height="{size}" style="border-radius: 50%; vertical-align: middle; margin-right: 12px; border: 3px solid rgba(255,255,255,0.9); background-color: rgba(0,0,0,0.4); padding: 2px; filter: drop-shadow(0px 4px 8px rgba(0,0,0,0.8)); object-fit: contain;">'
     return f'<span style="font-size: {size}px; vertical-align: middle; margin-right: 12px;">{icon_value}</span>'
@@ -231,9 +239,13 @@ if role == "👑 オーナー（管理者）":
         current_q_id = room_data.get("current_question_id", q_start)
         
         q_row = df_quiz[df_quiz["id"] == current_q_id]
+        current_question = q_row.iloc[0]["question"] if not q_row.empty else "問題データがありません"
         current_answer = q_row.iloc[0]["answer"] if not q_row.empty else ""
         
-        st.markdown(f"**現在のステータス**: `{current_status}` | **現在出題中の問題**: 第 `{current_q_id}` 問 (正解: **【 {current_answer} 】**)")
+        st.markdown(f"**現在のステータス**: `{current_status}` | **現在出題中の問題**: 第 `{current_q_id}` 問")
+        
+        # --- オーナー画面用の出題問題表示エリア ---
+        st.info(f"❓ **出題中の問題 (第 {current_q_id} 問):**\n\n### {current_question}\n\n💡 **正解:** **【 {current_answer} 】**")
         
         col_btn1, col_btn2, col_btn3 = st.columns(3)
         with col_btn1:
