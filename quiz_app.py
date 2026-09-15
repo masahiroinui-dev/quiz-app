@@ -60,7 +60,7 @@ else:
 
 st.markdown(bg_css, unsafe_allow_html=True)
 
-# 視認性CSS（文字入力フィールド内部をはっきり見える黒文字に変更）
+# 視認性CSS（文字入力フィールド内部を黒文字指定）
 st.markdown("""
     <style>
     .block-container {
@@ -81,7 +81,7 @@ st.markdown("""
         border-right: 1px solid rgba(255, 255, 255, 0.15);
     }
 
-    /* --- 入力フィールド内の文字色を「黒」に強制設定 --- */
+    /* 入力フィールドのテキスト色（黒） */
     input, select, textarea {
         color: #000000 !important;
         -webkit-text-fill-color: #000000 !important;
@@ -89,7 +89,6 @@ st.markdown("""
         font-weight: bold !important;
     }
 
-    /* ボタン類 */
     button[kind="primary"] {
         background-color: #00d2ff !important;
         color: #000000 !important;
@@ -145,6 +144,9 @@ def get_quiz_data():
             df = pd.read_csv(csv_file, encoding="shift-jis")
             
         df["id"] = range(1, len(df) + 1)
+        # 空白除去
+        df["answer"] = df["answer"].astype(str).str.strip()
+        df["question"] = df["question"].astype(str).str.strip()
         return df
     else:
         st.error(f"クイズファイル `{csv_file}` が見つかりません。")
@@ -239,7 +241,7 @@ if role == "👑 オーナー（管理者）":
         
         st.markdown(f"**現在のステータス**: `{current_status}` | **現在出題中の問題番号**: 第 `{current_q_id}` 問")
         
-        # オーナー用 出題テキストの表示エリア（出題中は正解を隠し、正答発表時のみ表示）
+        # オーナー用 出題テキスト表示（出題中は正解を非表示）
         if current_status == "answer":
             st.info(f"❓ **出題中の問題 (第 {current_q_id} 問):**\n\n### {current_question}\n\n💡 **正解:** **【 {current_answer} 】**")
         else:
@@ -286,7 +288,7 @@ if role == "👑 オーナー（管理者）":
             def judge_answer(ans):
                 if not ans or str(ans).strip() == "":
                     return "-"
-                return "⭕ 正解" if str(ans).strip() == str(current_answer).strip() else "❌ 不正解"
+                return "⭕ 正解" if str(ans).strip().lower() == str(current_answer).strip().lower() else "❌ 不正解"
 
             df_players["判定"] = df_players["last_answer"].apply(judge_answer)
             
@@ -318,6 +320,8 @@ else:
         st.session_state.room_code = "ROOM1"
     if "icon" not in st.session_state:
         st.session_state.icon = list(available_icons.values())[0]
+    if "answered_q_id" not in st.session_state:
+        st.session_state.answered_q_id = None
         
     if not st.session_state.joined:
         st.subheader("参加情報の入力")
@@ -372,36 +376,50 @@ else:
             q_row = df_quiz[df_quiz["id"] == current_q_id]
             if not q_row.empty:
                 q_text = q_row.iloc[0]["question"]
-                correct_ans = q_row.iloc[0]["answer"]
+                correct_ans = str(q_row.iloc[0]["answer"]).strip()
                 
                 st.subheader(f"❓ 第 {current_q_id} 問")
                 st.markdown(f"#### {q_text}")
                 
-                user_ans = st.text_input("回答を入力してください", key=f"ans_{current_q_id}")
+                # 問題が変わった場合、回答済状態を初期化
+                if st.session_state.answered_q_id != current_q_id:
+                    already_submitted = False
+                else:
+                    already_submitted = True
                 
-                if st.button("解答を送信", type="primary"):
-                    p_res = safe_execute(supabase.table("players").select("score, combo").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
-                    if p_res.data:
-                        p_data = p_res.data[0]
-                        current_score = p_data.get("score", 0)
-                        current_combo = p_data.get("combo", 0)
-                        
-                        if user_ans.strip() == correct_ans.strip():
-                            new_combo = current_combo + 1
-                            add_score = 100 + (new_combo - 1) * 20
-                            new_score = current_score + add_score
-                            st.success(f"⭕ 送信完了！ (+{add_score}pt / {new_combo}コンボ)")
+                user_input = st.text_input("回答を入力してください", key=f"input_q_{current_q_id}", disabled=already_submitted)
+                
+                if not already_submitted:
+                    if st.button("解答を送信", type="primary"):
+                        if not user_input.strip():
+                            st.error("回答を入力してください。")
                         else:
-                            new_combo = 0
-                            new_score = current_score
-                            st.warning("❌ 送信完了！")
-                            
-                        query = supabase.table("players").update({
-                            "score": new_score,
-                            "combo": new_combo,
-                            "last_answer": user_ans
-                        }).eq("room_code", room_code).eq("player_name", st.session_state.player_name)
-                        safe_execute(query)
+                            p_res = safe_execute(supabase.table("players").select("score, combo").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
+                            if p_res.data:
+                                p_data = p_res.data[0]
+                                current_score = p_data.get("score", 0)
+                                current_combo = p_data.get("combo", 0)
+                                
+                                # 完全一致判定（大文字小文字・前後空白無視）
+                                if user_input.strip().lower() == correct_ans.lower():
+                                    new_combo = current_combo + 1
+                                    add_score = 100 + (new_combo - 1) * 20
+                                    new_score = current_score + add_score
+                                else:
+                                    new_combo = 0
+                                    new_score = current_score
+                                    
+                                query = supabase.table("players").update({
+                                    "score": new_score,
+                                    "combo": new_combo,
+                                    "last_answer": user_input.strip()
+                                }).eq("room_code", room_code).eq("player_name", st.session_state.player_name)
+                                safe_execute(query)
+                                
+                                st.session_state.answered_q_id = current_q_id
+                                st.rerun()
+                else:
+                    st.success("✅ 回答を送信しました！正答発表をお待ちください。")
             
             time.sleep(1)
             st.rerun()
@@ -413,9 +431,17 @@ else:
                 st.subheader(f"⭕ 第 {current_q_id} 問 の正解発表")
                 st.success(f"正解は **【 {correct_ans} 】** でした！")
                 
-                p_res = safe_execute(supabase.table("players").select("score, combo").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
+                p_res = safe_execute(supabase.table("players").select("score, combo, last_answer").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
                 if p_res.data:
                     p = p_res.data[0]
+                    user_ans = p.get("last_answer", "")
+                    
+                    if user_ans.strip().lower() == str(correct_ans).strip().lower():
+                        st.balloons()
+                        st.markdown(f"🎉 **正解！** あなたの回答: `{user_ans}`")
+                    else:
+                        st.markdown(f"❌ **不正解...** あなたの回答: `{user_ans if user_ans else '未回答'}`")
+                        
                     st.markdown(f"現在のスコア: **{p.get('score', 0)} pt** | コンボ: **{p.get('combo', 0)}**")
             
             time.sleep(1)
@@ -444,4 +470,5 @@ else:
                 
             if st.button("最初に戻る"):
                 st.session_state.joined = False
+                st.session_state.answered_q_id = None
                 st.rerun()
