@@ -172,6 +172,19 @@ def get_shuffled_questions(s_id: int, e_id: int, seed: int):
         return []
     return sub_df.sample(frac=1, random_state=seed)["q_id"].tolist()
 
+# q_start_id カラムにエンコードされた (start_id, seed) をパースするヘルパー関数
+def encode_start_and_seed(s_id: int, seed: int) -> int:
+    # 例: s_id=1, seed=123456 -> 10000000001 + (seed % 1000000)*10
+    # 簡易的に [100万 * s_id + (seed % 100万)] の整数として格納
+    return s_id * 1000000 + (seed % 1000000)
+
+def decode_start_and_seed(encoded_val: int, default_start: int):
+    if not encoded_val or encoded_val < 1000000:
+        return encoded_val if encoded_val else default_start, 42
+    s_id = encoded_val // 1000000
+    seed = encoded_val % 1000000
+    return s_id, seed
+
 # --------------------------------------------------
 # キャラアイコン読み込み
 # --------------------------------------------------
@@ -234,14 +247,16 @@ if role == "👑 オーナー（管理者）":
             e_id = max(int(q_start), int(q_end))
             new_seed = int(time.time())
             
-            # ルームが存在するか事前確認してInsert/Updateを振り分け
+            # DBのq_start_idに (s_id と seed) をまとめてエンコード保存することで全端末共通化
+            encoded_val = encode_start_and_seed(s_id, new_seed)
+            
             existing_room = safe_execute(supabase.table("rooms").select("room_code").eq("room_code", room_code)).data
             
             room_payload = {
                 "room_code": room_code,
                 "status": "waiting",
                 "current_question_id": 0,
-                "q_start_id": s_id,
+                "q_start_id": encoded_val,
                 "q_end_id": e_id
             }
             
@@ -250,7 +265,6 @@ if role == "👑 オーナー（管理者）":
             else:
                 safe_execute(supabase.table("rooms").insert(room_payload))
             
-            st.session_state[f"shuffle_seed_{room_code}"] = new_seed
             safe_execute(supabase.table("players").delete().eq("room_code", room_code))
             
             sub_q = get_shuffled_questions(s_id, e_id, new_seed)
@@ -272,10 +286,10 @@ if role == "👑 オーナー（管理者）":
         current_status = room_data.get("status", "waiting")
         current_idx = int(room_data.get("current_question_id", 0))
         
-        s_id = int(room_data.get("q_start_id", min_q_id))
+        raw_start_val = room_data.get("q_start_id", min_q_id)
+        s_id, seed = decode_start_and_seed(int(raw_start_val) if raw_start_val else min_q_id, min_q_id)
         e_id = int(room_data.get("q_end_id", max_q_id))
         
-        seed = st.session_state.get(f"shuffle_seed_{room_code}", 42)
         question_order = get_shuffled_questions(s_id, e_id, seed)
         
         total_q = len(question_order)
@@ -393,7 +407,6 @@ else:
             if not p_name:
                 st.error("プレイヤー名を入力してください。")
             else:
-                # 既に登録済みのプレイヤーか事前確認（安全な重複・連打防止）
                 check_res = safe_execute(supabase.table("players").select("player_name").eq("room_code", r_code).eq("player_name", p_name))
                 
                 player_payload = {
@@ -406,10 +419,8 @@ else:
                 }
                 
                 if check_res.data:
-                    # すでに存在する場合は更新
                     safe_execute(supabase.table("players").update(player_payload).eq("room_code", r_code).eq("player_name", p_name))
                 else:
-                    # 未存在の場合は新規登録
                     safe_execute(supabase.table("players").insert(player_payload))
                     
                 st.session_state.joined = True
@@ -429,10 +440,10 @@ else:
         status = room_data.get("status", "waiting")
         current_idx = int(room_data.get("current_question_id", 0))
         
-        s_id = int(room_data.get("q_start_id", min_q_id))
+        raw_start_val = room_data.get("q_start_id", min_q_id)
+        s_id, seed = decode_start_and_seed(int(raw_start_val) if raw_start_val else min_q_id, min_q_id)
         e_id = int(room_data.get("q_end_id", max_q_id))
         
-        seed = st.session_state.get(f"shuffle_seed_{room_code}", 42)
         question_order = get_shuffled_questions(s_id, e_id, seed)
         
         if st.session_state.last_processed_idx != current_idx:
