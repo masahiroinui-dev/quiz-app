@@ -132,10 +132,10 @@ def safe_execute(query, retries=2, delay=0.2):
             time.sleep(delay)
 
 # --------------------------------------------------
-# クイズデータ読み込み & 複数正解判定用関数
+# クイズデータ読み込み（ランダムシャッフル機能付き）
 # --------------------------------------------------
 @st.cache_data
-def get_quiz_data():
+def get_quiz_data(seed: int = 42):
     csv_file = "questions.csv"
     
     if os.path.exists(csv_file):
@@ -144,6 +144,8 @@ def get_quiz_data():
         except UnicodeDecodeError:
             df = pd.read_csv(csv_file, encoding="shift-jis")
             
+        # ランダムに並び替え（シャッフル）
+        df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
         df["id"] = range(1, len(df) + 1)
         df["answer"] = df["answer"].astype(str).str.strip()
         df["question"] = df["question"].astype(str).str.strip()
@@ -152,7 +154,11 @@ def get_quiz_data():
         st.error(f"クイズファイル `{csv_file}` が見つかりません。")
         st.stop()
 
-df_quiz = get_quiz_data()
+# シャッフルシード用のセッションステート
+if "shuffle_seed" not in st.session_state:
+    st.session_state.shuffle_seed = 42
+
+df_quiz = get_quiz_data(st.session_state.shuffle_seed)
 
 # スラッシュ(/や／)区切りの複数正解を判定する関数
 def check_is_correct(user_ans: str, raw_correct_ans: str) -> bool:
@@ -218,7 +224,7 @@ if role == "👑 オーナー（管理者）":
     with col3:
         q_end = st.number_input("終了問題ID", min_value=1, max_value=len(df_quiz), value=len(df_quiz))
         
-    btn_col1, btn_col2 = st.columns([2, 1])
+    btn_col1, btn_col2, btn_col3 = st.columns([2, 1, 1])
     with btn_col1:
         if st.button("🚀 ルームを作成 / 初期化する（参加者データも消去）", type="primary"):
             st.cache_data.clear()
@@ -230,9 +236,17 @@ if role == "👑 オーナー（管理者）":
                 "q_end_id": int(q_end)
             }, on_conflict="room_code"))
             safe_execute(supabase.table("players").delete().eq("room_code", room_code))
-            st.success(f"ルーム `{room_code}` と参加者データを初期化しました！（開始ID: {q_start} / 終了ID: {q_end}）")
-            
+            st.success(f"ルーム `{room_code}` を待機状態で初期化しました！（開始ID: {q_start} / 終了ID: {q_end}）")
+            st.rerun()
+
     with btn_col2:
+        if st.button("🔀 問題をランダム再配置"):
+            st.session_state.shuffle_seed = int(time.time())
+            st.cache_data.clear()
+            st.success("問題の出題順を再シャッフルしました！")
+            st.rerun()
+
+    with btn_col3:
         if st.button("🗑️ 参加者データのみクリア"):
             safe_execute(supabase.table("players").delete().eq("room_code", room_code))
             st.success("参加者データをクリアしました。")
@@ -251,10 +265,11 @@ if role == "👑 オーナー（管理者）":
         current_question = q_row.iloc[0]["question"] if not q_row.empty else "問題データがありません"
         current_answer = q_row.iloc[0]["answer"] if not q_row.empty else ""
         
-        st.markdown(f"**現在のステータス**: `{current_status}` | **現在出題中の問題番号**: 第 `{current_q_id}` 問")
+        st.markdown(f"**現在のステータス**: `{current_status}` | **出題中の問題番号**: 第 `{current_q_id}` 問")
         
-        # オーナー用 出題テキスト表示（出題中は正解を非表示）
-        if current_status == "answer":
+        if current_status == "waiting":
+            st.warning("⏳ 参加者待機中です。「📢 クイズを出題（進行中）」を押すとプレイヤーに第1問が表示されます。")
+        elif current_status == "answer":
             st.info(f"❓ **出題中の問題 (第 {current_q_id} 問):**\n\n### {current_question}\n\n💡 **正解:** **【 {current_answer} 】**")
         else:
             st.info(f"❓ **出題中の問題 (第 {current_q_id} 問):**\n\n### {current_question}\n\n🔒 *(正解は「正答発表」を押すと表示されます)*")
