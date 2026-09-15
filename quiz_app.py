@@ -20,7 +20,7 @@ def get_base64_image(image_path: str) -> str:
     return ""
 
 # --------------------------------------------------
-# 背景画像 & スタイル設定 (大文字・小文字・複数拡張子対応)
+# 背景画像 & スタイル設定
 # --------------------------------------------------
 bg_file = None
 bg_candidates = [
@@ -60,7 +60,7 @@ else:
 
 st.markdown(bg_css, unsafe_allow_html=True)
 
-# 視認性CSS（暗め透過背景 ＋ 白文字）
+# 視認性CSS（ダーク透過＋高透過率＋白文字）
 st.markdown("""
     <style>
     .block-container {
@@ -81,17 +81,29 @@ st.markdown("""
         border-right: 1px solid rgba(255, 255, 255, 0.15);
     }
 
-    /* 入力フィールド：黒透過背景 ＋ 鮮明な白文字 */
-    div[data-baseweb="input"] > div, div[data-baseweb="select"] > div {
-        background-color: rgba(0, 0, 0, 0.65) !important;
+    /* 入力フィールド全般（ダーク透過化強固指定） */
+    div[data-baseweb="input"],
+    div[data-baseweb="input"] > div,
+    div[data-baseweb="base-input"],
+    div[data-baseweb="select"],
+    div[data-baseweb="select"] > div {
+        background-color: rgba(15, 18, 30, 0.75) !important;
         border-radius: 8px !important;
-        border: 1px solid rgba(255, 255, 255, 0.3) !important;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5) !important;
+        border: 1px solid rgba(255, 255, 255, 0.4) !important;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6) !important;
     }
-    input {
+
+    input, select, textarea, div[data-baseweb="select"] span {
         color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
         text-shadow: none !important;
         font-weight: bold !important;
+        background-color: transparent !important;
+    }
+
+    button[aria-label="Increase value"], button[aria-label="Decrease value"] {
+        background-color: transparent !important;
+        color: #ffffff !important;
     }
 
     button[kind="primary"] {
@@ -126,7 +138,7 @@ except Exception as e:
     st.error("Supabaseへの接続に失敗しました。.streamlit/secrets.toml の設定を確認してください。")
     st.stop()
 
-def safe_execute(query, retries=3, delay=0.5):
+def safe_execute(query, retries=2, delay=0.2):
     for i in range(retries):
         try:
             return query.execute()
@@ -136,7 +148,7 @@ def safe_execute(query, retries=3, delay=0.5):
             time.sleep(delay)
 
 # --------------------------------------------------
-# クイズデータ読み込み（IDを固定割り当て）
+# クイズデータ読み込み
 # --------------------------------------------------
 @st.cache_data
 def get_quiz_data():
@@ -148,7 +160,6 @@ def get_quiz_data():
         except UnicodeDecodeError:
             df = pd.read_csv(csv_file, encoding="shift-jis")
             
-        # CSVの行番号（1〜）を問題IDとして固定定義
         df["id"] = range(1, len(df) + 1)
         return df
     else:
@@ -281,7 +292,7 @@ if role == "👑 オーナー（管理者）":
         st.divider()
         st.subheader("📊 参加者一覧と回答リアルタイム状況")
         
-        players_res = safe_execute(supabase.table("players").select("*").eq("room_code", room_code).order("score", desc=True))
+        players_res = safe_execute(supabase.table("players").select("player_name, last_answer, score, combo").eq("room_code", room_code).order("score", desc=True))
         if players_res.data:
             df_players = pd.DataFrame(players_res.data)
             
@@ -303,7 +314,7 @@ if role == "👑 オーナー（管理者）":
         else:
             st.info("現在参加者はいません。")
             
-    time.sleep(2)
+    time.sleep(1)  # 待ち時間を1秒に短縮
     st.rerun()
 
 # --------------------------------------------------
@@ -349,7 +360,7 @@ else:
                 st.rerun()
     else:
         room_code = st.session_state.room_code
-        room_res = safe_execute(supabase.table("rooms").select("*").eq("room_code", room_code))
+        room_res = safe_execute(supabase.table("rooms").select("status, current_question_id").eq("room_code", room_code))
         
         if not room_res.data:
             st.error("指定されたルームコードが存在しません。")
@@ -367,7 +378,7 @@ else:
         
         if status == "waiting":
             st.info("⏳ オーナーがクイズを開始するのを待っています...")
-            time.sleep(2)
+            time.sleep(1)
             st.rerun()
             
         elif status == "question":
@@ -382,7 +393,7 @@ else:
                 user_ans = st.text_input("回答を入力してください", key=f"ans_{current_q_id}")
                 
                 if st.button("解答を送信", type="primary"):
-                    p_res = safe_execute(supabase.table("players").select("*").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
+                    p_res = safe_execute(supabase.table("players").select("score, combo").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
                     if p_res.data:
                         p_data = p_res.data[0]
                         current_score = p_data.get("score", 0)
@@ -404,7 +415,8 @@ else:
                             "last_answer": user_ans
                         }).eq("room_code", room_code).eq("player_name", st.session_state.player_name)
                         safe_execute(query)
-            time.sleep(2)
+            
+            time.sleep(1)  # 待ち時間を1秒に短縮
             st.rerun()
             
         elif status == "answer":
@@ -414,17 +426,18 @@ else:
                 st.subheader(f"⭕ 第 {current_q_id} 問 の正解発表")
                 st.success(f"正解は **【 {correct_ans} 】** でした！")
                 
-                p_res = safe_execute(supabase.table("players").select("*").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
+                p_res = safe_execute(supabase.table("players").select("score, combo").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
                 if p_res.data:
                     p = p_res.data[0]
                     st.markdown(f"現在のスコア: **{p.get('score', 0)} pt** | コンボ: **{p.get('combo', 0)}**")
-            time.sleep(2)
+            
+            time.sleep(1)  # 待ち時間を1秒に短縮
             st.rerun()
             
         elif status == "finished":
             st.title("🏆 最終結果発表 🏆")
             
-            players_res = safe_execute(supabase.table("players").select("*").eq("room_code", room_code).order("score", desc=True))
+            players_res = safe_execute(supabase.table("players").select("icon, player_name, score, combo").eq("room_code", room_code).order("score", desc=True))
             players_data = players_res.data
             
             if players_data:
