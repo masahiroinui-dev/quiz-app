@@ -5,6 +5,7 @@ import time
 import base64
 import os
 import re
+import hashlib
 
 # --------------------------------------------------
 # ページ設定
@@ -165,25 +166,17 @@ def check_is_correct(user_ans: str, raw_correct_ans: str) -> bool:
     valid_answers = [a.strip().lower() for a in answers if a.strip()]
     return clean_user in valid_answers
 
-# 指定範囲のシャッフルリストをシード値から計算するヘルパー関数
-def get_shuffled_questions(s_id: int, e_id: int, seed: int):
+# ルーム名と問題範囲から決定論的な共通シード値を生成してシャッフルする関数
+def get_shuffled_questions(s_id: int, e_id: int, room_code: str):
     sub_df = df_raw_quiz[(df_raw_quiz["q_id"] >= s_id) & (df_raw_quiz["q_id"] <= e_id)]
     if sub_df.empty:
         return []
-    return sub_df.sample(frac=1, random_state=seed)["q_id"].tolist()
-
-# q_start_id カラムにエンコードされた (start_id, seed) をパースするヘルパー関数
-def encode_start_and_seed(s_id: int, seed: int) -> int:
-    # 例: s_id=1, seed=123456 -> 10000000001 + (seed % 1000000)*10
-    # 簡易的に [100万 * s_id + (seed % 100万)] の整数として格納
-    return s_id * 1000000 + (seed % 1000000)
-
-def decode_start_and_seed(encoded_val: int, default_start: int):
-    if not encoded_val or encoded_val < 1000000:
-        return encoded_val if encoded_val else default_start, 42
-    s_id = encoded_val // 1000000
-    seed = encoded_val % 1000000
-    return s_id, seed
+    
+    # ルームコードとID範囲から常に共通の数値シードを生成
+    seed_string = f"{room_code}_{s_id}_{e_id}"
+    seed_num = int(hashlib.md5(seed_string.encode('utf-8')).hexdigest(), 16) % (2**32)
+    
+    return sub_df.sample(frac=1, random_state=seed_num)["q_id"].tolist()
 
 # --------------------------------------------------
 # キャラアイコン読み込み
@@ -245,10 +238,6 @@ if role == "👑 オーナー（管理者）":
         if st.button("🚀 ルームを作成 / 初期化する（指定範囲でシャッフル）", type="primary"):
             s_id = min(int(q_start), int(q_end))
             e_id = max(int(q_start), int(q_end))
-            new_seed = int(time.time())
-            
-            # DBのq_start_idに (s_id と seed) をまとめてエンコード保存することで全端末共通化
-            encoded_val = encode_start_and_seed(s_id, new_seed)
             
             existing_room = safe_execute(supabase.table("rooms").select("room_code").eq("room_code", room_code)).data
             
@@ -256,7 +245,7 @@ if role == "👑 オーナー（管理者）":
                 "room_code": room_code,
                 "status": "waiting",
                 "current_question_id": 0,
-                "q_start_id": encoded_val,
+                "q_start_id": s_id,
                 "q_end_id": e_id
             }
             
@@ -267,7 +256,7 @@ if role == "👑 オーナー（管理者）":
             
             safe_execute(supabase.table("players").delete().eq("room_code", room_code))
             
-            sub_q = get_shuffled_questions(s_id, e_id, new_seed)
+            sub_q = get_shuffled_questions(s_id, e_id, room_code)
             st.success(f"ルーム `{room_code}` を初期化しました！ 問題ID {s_id}〜{e_id} の全 {len(sub_q)} 問をシャッフルしました。")
             st.rerun()
 
@@ -286,11 +275,10 @@ if role == "👑 オーナー（管理者）":
         current_status = room_data.get("status", "waiting")
         current_idx = int(room_data.get("current_question_id", 0))
         
-        raw_start_val = room_data.get("q_start_id", min_q_id)
-        s_id, seed = decode_start_and_seed(int(raw_start_val) if raw_start_val else min_q_id, min_q_id)
+        s_id = int(room_data.get("q_start_id", min_q_id))
         e_id = int(room_data.get("q_end_id", max_q_id))
         
-        question_order = get_shuffled_questions(s_id, e_id, seed)
+        question_order = get_shuffled_questions(s_id, e_id, room_code)
         
         total_q = len(question_order)
         
@@ -440,11 +428,10 @@ else:
         status = room_data.get("status", "waiting")
         current_idx = int(room_data.get("current_question_id", 0))
         
-        raw_start_val = room_data.get("q_start_id", min_q_id)
-        s_id, seed = decode_start_and_seed(int(raw_start_val) if raw_start_val else min_q_id, min_q_id)
+        s_id = int(room_data.get("q_start_id", min_q_id))
         e_id = int(room_data.get("q_end_id", max_q_id))
         
-        question_order = get_shuffled_questions(s_id, e_id, seed)
+        question_order = get_shuffled_questions(s_id, e_id, room_code)
         
         if st.session_state.last_processed_idx != current_idx:
             st.session_state.submitted = False
