@@ -12,6 +12,8 @@ import hashlib
 # --------------------------------------------------
 st.set_page_config(page_title="リアルタイムクイズシステム", page_icon="🧩", layout="wide")
 
+TIME_LIMIT = 30  # 制限時間（秒）
+
 # --------------------------------------------------
 # ローカル画像をBase64に変換するヘルパー関数
 # --------------------------------------------------
@@ -157,7 +159,6 @@ def get_raw_quiz_data():
 
 df_raw_quiz = get_raw_quiz_data()
 
-# スラッシュ(/や／)区切りの複数正解を判定する関数
 def check_is_correct(user_ans: str, raw_correct_ans: str) -> bool:
     if not user_ans or not user_ans.strip():
         return False
@@ -166,16 +167,12 @@ def check_is_correct(user_ans: str, raw_correct_ans: str) -> bool:
     valid_answers = [a.strip().lower() for a in answers if a.strip()]
     return clean_user in valid_answers
 
-# ルーム名と問題範囲から決定論的な共通シード値を生成してシャッフルする関数
 def get_shuffled_questions(s_id: int, e_id: int, room_code: str):
     sub_df = df_raw_quiz[(df_raw_quiz["q_id"] >= s_id) & (df_raw_quiz["q_id"] <= e_id)]
     if sub_df.empty:
         return []
-    
-    # ルームコードとID範囲から常に共通の数値シードを生成
     seed_string = f"{room_code}_{s_id}_{e_id}"
     seed_num = int(hashlib.md5(seed_string.encode('utf-8')).hexdigest(), 16) % (2**32)
-    
     return sub_df.sample(frac=1, random_state=seed_num)["q_id"].tolist()
 
 # --------------------------------------------------
@@ -246,7 +243,8 @@ if role == "👑 オーナー（管理者）":
                 "status": "waiting",
                 "current_question_id": 0,
                 "q_start_id": s_id,
-                "q_end_id": e_id
+                "q_end_id": e_id,
+                "question_start_time": 0
             }
             
             if existing_room:
@@ -274,12 +272,12 @@ if role == "👑 オーナー（管理者）":
         room_data = room_res.data[0]
         current_status = room_data.get("status", "waiting")
         current_idx = int(room_data.get("current_question_id", 0))
+        q_start_time = float(room_data.get("question_start_time", 0) or 0)
         
         s_id = int(room_data.get("q_start_id", min_q_id))
         e_id = int(room_data.get("q_end_id", max_q_id))
         
         question_order = get_shuffled_questions(s_id, e_id, room_code)
-        
         total_q = len(question_order)
         
         if total_q > 0 and current_idx < total_q:
@@ -299,13 +297,18 @@ if role == "👑 オーナー（管理者）":
         elif current_status == "answer":
             st.info(f"❓ **現在の問題 ({current_idx + 1}/{total_q}問目):**\n\n### {current_question}\n\n💡 **正解:** **【 {current_answer} 】**")
         else:
-            st.info(f"❓ **現在の問題 ({current_idx + 1}/{total_q}問目):**\n\n### {current_question}\n\n🔒 *(正解は「正答発表」を押すと表示されます)*")
+            elapsed = time.time() - q_start_time if q_start_time > 0 else 0
+            rem_time = max(0, int(TIME_LIMIT - elapsed))
+            st.info(f"❓ **現在の問題 ({current_idx + 1}/{total_q}問目):**\n\n### {current_question}\n\n⏱️ **残り時間:** `{rem_time}` 秒\n\n🔒 *(正解は「正答発表」を押すと表示されます)*")
         
         col_btn1, col_btn2, col_btn3 = st.columns(3)
         with col_btn1:
             if st.button("📢 クイズを出題（進行中）"):
                 safe_execute(supabase.table("players").update({"last_answer": ""}).eq("room_code", room_code))
-                safe_execute(supabase.table("rooms").update({"status": "question"}).eq("room_code", room_code))
+                safe_execute(supabase.table("rooms").update({
+                    "status": "question",
+                    "question_start_time": time.time()
+                }).eq("room_code", room_code))
                 st.rerun()
                 
         with col_btn2:
@@ -322,7 +325,8 @@ if role == "👑 オーナー（管理者）":
                     safe_execute(supabase.table("players").update({"last_answer": ""}).eq("room_code", room_code))
                     safe_execute(supabase.table("rooms").update({
                         "status": "question",
-                        "current_question_id": next_idx
+                        "current_question_id": next_idx,
+                        "question_start_time": time.time()
                     }).eq("room_code", room_code))
                 st.rerun()
                 
@@ -427,6 +431,7 @@ else:
         room_data = room_res.data[0]
         status = room_data.get("status", "waiting")
         current_idx = int(room_data.get("current_question_id", 0))
+        q_start_time = float(room_data.get("question_start_time", 0) or 0)
         
         s_id = int(room_data.get("q_start_id", min_q_id))
         e_id = int(room_data.get("q_end_id", max_q_id))
@@ -454,16 +459,30 @@ else:
                     q_text = q_row.iloc[0]["question"]
                     correct_ans = str(q_row.iloc[0]["answer"]).strip()
                     
+                    # 経過時間と残時間の計算
+                    elapsed = time.time() - q_start_time if q_start_time > 0 else 0
+                    remaining = max(0, int(TIME_LIMIT - elapsed))
+                    is_time_up = (remaining <= 0)
+                    
                     st.subheader(f"❓ 第 {current_idx + 1} 問")
                     st.markdown(f"#### {q_text}")
+                    
+                    # 視覚的プログレスバー表示
+                    progress = float(remaining / TIME_LIMIT)
+                    st.progress(progress)
+                    
+                    if is_time_up:
+                        st.error("⏰ 制限時間終了（30秒経ちました）")
+                    else:
+                        st.warning(f"⏱️ 残り時間: **{remaining}** 秒")
                     
                     user_input = st.text_input(
                         "回答を入力してください",
                         key=f"input_{current_idx}",
-                        disabled=st.session_state.submitted
+                        disabled=st.session_state.submitted or is_time_up
                     )
                     
-                    if not st.session_state.submitted:
+                    if not st.session_state.submitted and not is_time_up:
                         if st.button("解答を送信", type="primary"):
                             if not user_input.strip():
                                 st.error("回答を入力してください。")
@@ -492,8 +511,10 @@ else:
                                     
                                     st.session_state.submitted = True
                                     st.rerun()
-                    else:
+                    elif st.session_state.submitted:
                         st.success("✅ 回答を送信しました！正答発表をお待ちください。")
+                    elif is_time_up:
+                        st.info("時間切れのため回答受付を終了しました。")
             
             time.sleep(1)
             st.rerun()
