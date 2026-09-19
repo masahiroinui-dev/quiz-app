@@ -124,14 +124,16 @@ except Exception as e:
     st.error("Supabaseへの接続に失敗しました。.streamlit/secrets.toml の設定を確認してください。")
     st.stop()
 
-def safe_execute(query, retries=2, delay=0.2):
+def safe_execute(query, retries=3, delay=0.3):
+    """通信エラーが発生してもクラッシュさせず、指定回数リトライする"""
     for i in range(retries):
         try:
             return query.execute()
         except Exception as e:
             if i == retries - 1:
-                raise e
+                return None
             time.sleep(delay)
+    return None
 
 # --------------------------------------------------
 # クイズデータ読み込み
@@ -160,9 +162,9 @@ def get_raw_quiz_data():
 df_raw_quiz = get_raw_quiz_data()
 
 def check_is_correct(user_ans: str, raw_correct_ans: str) -> bool:
-    if not user_ans or not user_ans.strip():
+    if not user_ans or not str(user_ans).strip():
         return False
-    clean_user = user_ans.strip().lower()
+    clean_user = str(user_ans).strip().lower()
     answers = re.split(r'[/／]', str(raw_correct_ans))
     valid_answers = [a.strip().lower() for a in answers if a.strip()]
     return clean_user in valid_answers
@@ -193,9 +195,9 @@ if not available_icons:
     available_icons = {"キャラ01": "🐶", "キャラ02": "🐱", "キャラ03": "🦊", "キャラ04": "🤖"}
 
 def render_icon_html(icon_value: str, size: int = 70) -> str:
-    if icon_value.startswith("data:image"):
+    if icon_value and str(icon_value).startswith("data:image"):
         return f'<img src="{icon_value}" width="{size}" height="{size}" style="border-radius: 50%; vertical-align: middle; margin-right: 12px; border: 3px solid rgba(255,255,255,0.9); background-color: rgba(0,0,0,0.4); padding: 2px; filter: drop-shadow(0px 4px 8px rgba(0,0,0,0.8)); object-fit: contain;">'
-    return f'<span style="font-size: {size}px; vertical-align: middle; margin-right: 12px;">{icon_value}</span>'
+    return f'<span style="font-size: {size}px; vertical-align: middle; margin-right: 12px;">{icon_value if icon_value else "👤"}</span>'
 
 # --------------------------------------------------
 # サイドバー: 役割選択
@@ -236,7 +238,8 @@ if role == "👑 オーナー（管理者）":
             s_id = min(int(q_start), int(q_end))
             e_id = max(int(q_start), int(q_end))
             
-            existing_room = safe_execute(supabase.table("rooms").select("room_code").eq("room_code", room_code)).data
+            res = safe_execute(supabase.table("rooms").select("room_code").eq("room_code", room_code))
+            existing_room = res.data if res else []
             
             room_payload = {
                 "room_code": room_code,
@@ -268,14 +271,14 @@ if role == "👑 オーナー（管理者）":
     
     room_res = safe_execute(supabase.table("rooms").select("*").eq("room_code", room_code))
     
-    if room_res.data:
+    if room_res and room_res.data:
         room_data = room_res.data[0]
         current_status = room_data.get("status", "waiting")
-        current_idx = int(room_data.get("current_question_id", 0))
+        current_idx = int(room_data.get("current_question_id", 0) or 0)
         q_start_time = float(room_data.get("question_start_time", 0) or 0)
         
-        s_id = int(room_data.get("q_start_id", min_q_id))
-        e_id = int(room_data.get("q_end_id", max_q_id))
+        s_id = int(room_data.get("q_start_id", min_q_id) or min_q_id)
+        e_id = int(room_data.get("q_end_id", max_q_id) or max_q_id)
         
         question_order = get_shuffled_questions(s_id, e_id, room_code)
         total_q = len(question_order)
@@ -338,7 +341,7 @@ if role == "👑 オーナー（管理者）":
         st.subheader("📊 参加者一覧と回答リアルタイム状況")
         
         players_res = safe_execute(supabase.table("players").select("player_name, last_answer, score, combo").eq("room_code", room_code).order("score", desc=True))
-        if players_res.data:
+        if players_res and players_res.data:
             df_players = pd.DataFrame(players_res.data)
             
             def judge_answer(ans):
@@ -358,6 +361,8 @@ if role == "👑 オーナー（管理者）":
             st.dataframe(df_display, use_container_width=True)
         else:
             st.info("現在参加者はいません。")
+    else:
+        st.warning("⚠️ データベースからの取得に失敗しました。自動再読込中...")
             
     time.sleep(1)
     st.rerun()
@@ -375,7 +380,7 @@ else:
     if "room_code" not in st.session_state:
         st.session_state.room_code = "ROOM1"
     if "icon" not in st.session_state:
-        st.session_state.icon = list(available_icons.values())[0]
+        st.session_state.icon = list(available_icons.values())[0] if available_icons else "🐶"
     if "last_processed_idx" not in st.session_state:
         st.session_state.last_processed_idx = None
     if "submitted" not in st.session_state:
@@ -389,7 +394,7 @@ else:
             st.session_state.player_name = st.text_input("プレイヤー名（必須）")
         with c2:
             selected_icon_key = st.selectbox("アイコンを選択", list(available_icons.keys()))
-            st.session_state.icon = available_icons[selected_icon_key]
+            st.session_state.icon = available_icons.get(selected_icon_key, "🐶")
             st.markdown(f"選択中: {render_icon_html(st.session_state.icon, 80)}", unsafe_allow_html=True)
             
         if st.button("🎮 参加する", type="primary"):
@@ -399,20 +404,21 @@ else:
             if not p_name:
                 st.error("プレイヤー名を入力してください。")
             else:
-                check_res = safe_execute(supabase.table("players").select("player_name").eq("room_code", r_code).eq("player_name", p_name))
+                check_res = safe_execute(supabase.table("players").select("*").eq("room_code", r_code).eq("player_name", p_name))
                 
-                player_payload = {
-                    "room_code": r_code,
-                    "player_name": p_name,
-                    "icon": st.session_state.icon,
-                    "score": 0,
-                    "combo": 0,
-                    "last_answer": ""
-                }
-                
-                if check_res.data:
-                    safe_execute(supabase.table("players").update(player_payload).eq("room_code", r_code).eq("player_name", p_name))
+                if check_res and check_res.data:
+                    safe_execute(supabase.table("players").update({
+                        "icon": st.session_state.icon
+                    }).eq("room_code", r_code).eq("player_name", p_name))
                 else:
+                    player_payload = {
+                        "room_code": r_code,
+                        "player_name": p_name,
+                        "icon": st.session_state.icon,
+                        "score": 0,
+                        "combo": 0,
+                        "last_answer": ""
+                    }
                     safe_execute(supabase.table("players").insert(player_payload))
                     
                 st.session_state.joined = True
@@ -421,26 +427,28 @@ else:
         room_code = st.session_state.room_code
         room_res = safe_execute(supabase.table("rooms").select("*").eq("room_code", room_code))
         
-        if not room_res.data:
-            st.error("指定されたルームコードが存在しません。")
-            if st.button("退出する"):
-                st.session_state.joined = False
-                st.rerun()
-            st.stop()
+        if not room_res or not room_res.data:
+            st.warning("⚠️ ルーム情報を取得中（または一時的な通信エラー）...")
+            time.sleep(1)
+            st.rerun()
             
         room_data = room_res.data[0]
         status = room_data.get("status", "waiting")
-        current_idx = int(room_data.get("current_question_id", 0))
+        current_idx = int(room_data.get("current_question_id", 0) or 0)
         q_start_time = float(room_data.get("question_start_time", 0) or 0)
         
-        s_id = int(room_data.get("q_start_id", min_q_id))
-        e_id = int(room_data.get("q_end_id", max_q_id))
+        s_id = int(room_data.get("q_start_id", min_q_id) or min_q_id)
+        e_id = int(room_data.get("q_end_id", max_q_id) or max_q_id)
         
         question_order = get_shuffled_questions(s_id, e_id, room_code)
         
         if st.session_state.last_processed_idx != current_idx:
-            st.session_state.submitted = False
             st.session_state.last_processed_idx = current_idx
+            p_check = safe_execute(supabase.table("players").select("last_answer").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
+            if p_check and p_check.data and p_check.data[0].get("last_answer"):
+                st.session_state.submitted = True
+            else:
+                st.session_state.submitted = False
         
         icon_html = render_icon_html(st.session_state.icon, 64)
         st.markdown(f"### {icon_html} **{st.session_state.player_name}** さんの画面 (ルーム: `{room_code}`)", unsafe_allow_html=True)
@@ -459,7 +467,6 @@ else:
                     q_text = q_row.iloc[0]["question"]
                     correct_ans = str(q_row.iloc[0]["answer"]).strip()
                     
-                    # 経過時間と残時間の計算
                     elapsed = time.time() - q_start_time if q_start_time > 0 else 0
                     remaining = max(0, int(TIME_LIMIT - elapsed))
                     is_time_up = (remaining <= 0)
@@ -467,7 +474,6 @@ else:
                     st.subheader(f"❓ 第 {current_idx + 1} 問")
                     st.markdown(f"#### {q_text}")
                     
-                    # 視覚的プログレスバー表示
                     progress = float(remaining / TIME_LIMIT)
                     st.progress(progress)
                     
@@ -488,10 +494,10 @@ else:
                                 st.error("回答を入力してください。")
                             else:
                                 p_res = safe_execute(supabase.table("players").select("score, combo").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
-                                if p_res.data:
+                                if p_res and p_res.data:
                                     p_data = p_res.data[0]
-                                    current_score = p_data.get("score", 0)
-                                    current_combo = p_data.get("combo", 0)
+                                    current_score = p_data.get("score", 0) or 0
+                                    current_combo = p_data.get("combo", 0) or 0
                                     
                                     is_correct = check_is_correct(user_input, correct_ans)
                                     
@@ -530,7 +536,7 @@ else:
                     st.success(f"正解は **【 {correct_ans} 】** でした！")
                     
                     p_res = safe_execute(supabase.table("players").select("score, combo, last_answer").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
-                    if p_res.data:
+                    if p_res and p_res.data:
                         p = p_res.data[0]
                         user_ans = p.get("last_answer", "")
                         
@@ -549,7 +555,7 @@ else:
             st.title("🏆 最終結果発表 🏆")
             
             players_res = safe_execute(supabase.table("players").select("icon, player_name, score, combo").eq("room_code", room_code).order("score", desc=True))
-            players_data = players_res.data
+            players_data = players_res.data if players_res else []
             
             if players_data:
                 for idx, player in enumerate(players_data, 1):
