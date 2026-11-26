@@ -1,579 +1,502 @@
-import streamlit as st
-from supabase import create_client, Client
-import pandas as pd
-import time
-import base64
+import csv
+import random
+import json
 import os
-import re
-import hashlib
+import base64
+import warnings
+import streamlit as st
+import ollama
+from streamlit_local_storage import LocalStorage
 
-# --------------------------------------------------
-# ページ設定
-# --------------------------------------------------
-st.set_page_config(page_title="リアルタイムクイズシステム", page_icon="🧩", layout="wide")
+# Python 3.8以降の非推奨警告を非表示化
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-TIME_LIMIT = 30  # 制限時間（秒）
+# ==============================================================================
+# ★ 1. クイズ設定・基本パラメータ（ここを変更して1周あたりの問題数を調整できます）
+# ==============================================================================
+MAX_MISTAKES = 3                # 最大誤答数（3回でゲームオーバー）
+BASE_SCORE = 5                  # 正解時の基本獲得ポイント
+TOTAL_QUIZ_COUNT = 10           # ★ 1周あたりの出題数（ここを好きな数字に変更してください。None にするとCSVの全問題を出題）
 
-# --------------------------------------------------
-# ローカル画像をBase64に変換するヘルパー関数
-# --------------------------------------------------
-def get_base64_image(image_path: str) -> str:
-    if os.path.exists(image_path):
-        with open(image_path, "rb") as img_file:
-            return base64.b64encode(img_file.read()).decode()
-    return ""
+# --- ディレクトリ & ファイルパス設定 ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGE_DIR = os.path.join(BASE_DIR, "images")
+QUESTIONS_CSV_PATH = "quiz_questions.csv"  # クイズデータファイル名
 
-# --------------------------------------------------
-# 背景画像 & スタイル設定
-# --------------------------------------------------
-bg_file = None
-bg_candidates = [
-    "bg.png", "bg.jpg", "bg.jpeg", "bg.webp",
-    "BG.png", "BG.jpg", "BG.jpeg", "BG.webp",
-    "Bg.png", "Bg.jpg"
+# 背景画像ファイル名（images/ 直下に配置）
+QUIZ_SHOP_BG = "bg1.jpg"   # クイズ・ショップ画面用背景
+COMPLETED_BG = "bg2.jpg"   # おもちゃ箱画面用背景
+
+# ==============================================================================
+# ★ 2. キャラクター＆ショップ定義（新キャラ追加はここを編集するだけでOK！）
+# ==============================================================================
+# 新しいキャラクターを追加する場合は、以下のリストに辞書を追加し、
+# images/{id}/ フォルダ内に各部位の画像（head.jpg, body.jpg, right_hand.jpg, left_hand.jpg, right_leg.jpg, left_leg.jpg, complete.jpg）を配置してください。
+# ※特定の部位が存在しないキャラ（ぶろっこりの頭など）は "exclude_parts": ["head"] のように指定できます。
+
+CHARACTERS = [
+    {"id": "panda", "name": "ぱんだ", "emoji": "👑"},
+    {"id": "broccoli", "name": "ぶろっこり", "emoji": "🥦", "exclude_parts": ["head"]},
+    {"id": "kappa", "name": "かっぱ", "emoji": "🥒"},
+    {"id": "tengu", "name": "てんぐ", "emoji": "👺"},
+    {"id": "saru", "name": "さる", "emoji": "🐵"},
+    {"id": "buru", "name": "ブルさん", "emoji": "🐶"},
+    {"id": "daruma", "name": "だるま", "emoji": "　"},
+    {"id": "kinoko", "name": "キノコ", "emoji": "🍄"},
+    {"id": "megami", "name": "めがみ", "emoji": "🗽"},
+    {"id": "katteni", "name": "スター", "emoji": "🎤"},
+
+    # --- 新キャラ追加例（コメントを外して使えます） ---
+    # {"id": "usagi", "name": "うさぎ", "emoji": "🐰"},
 ]
 
-for cand in bg_candidates:
-    if os.path.exists(cand):
-        bg_file = cand
-        break
+# 部位のマスター定義（価格やファイル名を一元管理）
+PART_TEMPLATES = {
+    "head":       {"label": "あたま",   "price": 80, "file": "head.jpg"},
+    "body":       {"label": "からだ",   "price": 80, "file": "body.jpg"},
+    "right_hand": {"label": "みぎて",   "price": 50, "file": "right_hand.jpg"},
+    "left_hand":  {"label": "ひだりて", "price": 50, "file": "left_hand.jpg"},
+    "right_leg":  {"label": "みぎあし", "price": 50, "file": "right_leg.jpg"},
+    "left_leg":   {"label": "ひだりあし", "price": 50, "file": "left_leg.jpg"},
+}
 
-if bg_file:
-    bg_b64 = get_base64_image(bg_file)
-    ext = bg_file.split(".")[-1].lower()
-    if ext == "jpg":
-        ext = "jpeg"
-    bg_css = f"""
-    <style>
-    .stApp {{
-        background-image: url("data:image/{ext};base64,{bg_b64}");
-        background-size: cover;
-        background-position: center;
-        background-attachment: fixed;
-    }}
-    </style>
-    """
-else:
-    bg_css = """
-    <style>
-    .stApp {
-        background: linear-gradient(135deg, #1e1e2f 0%, #2a2a40 100%);
-    }
-    </style>
-    """
+# CHARACTERS の定義から SHOP_ITEMS を自動生成する関数
+def build_shop_items():
+    shop = {part_key: [] for part_key in PART_TEMPLATES.keys()}
+    for char in CHARACTERS:
+        char_id = char["id"]
+        char_name = char["name"]
+        emoji = char.get("emoji", "✨")
+        excluded = char.get("exclude_parts", [])
+        
+        for part_key, p_info in PART_TEMPLATES.items():
+            if part_key in excluded:
+                continue
+            shop[part_key].append({
+                "id": f"{char_id}_{part_key}",
+                "char_id": char_id,
+                "name": f"{emoji} {char_name}の{p_info['label']}",
+                "price": p_info["price"],
+                "file": p_info["file"]
+            })
+    return shop
 
-st.markdown(bg_css, unsafe_allow_html=True)
+SHOP_ITEMS = build_shop_items()
 
-# 視認性CSS
-st.markdown("""
-    <style>
-    .block-container {
-        background: transparent !important;
-        box-shadow: none !important;
-        padding-top: 2rem !important;
-    }
+# --- ブラウザ（ローカルストレージ）セーブ・ロード関数 ---
+local_storage = LocalStorage()
+DEFAULT_USER_DATA = {"wallet": 0, "owned_items": [], "completed_chars": []}
 
-    h1, h2, h3, h4, h5, h6, p, span, label, div, .stMarkdown {
-        color: #ffffff !important;
-        text-shadow: 0px 2px 6px rgba(0, 0, 0, 0.95), 0px 0px 12px rgba(0, 0, 0, 0.8) !important;
-        font-weight: 700 !important;
-    }
+def load_user_data_from_browser():
+    try:
+        saved_str = local_storage.getItem("quiz_app_user_data")
+        if saved_str:
+            return json.loads(saved_str)
+    except Exception:
+        pass
+    return DEFAULT_USER_DATA.copy()
 
-    section[data-testid="stSidebar"] {
-        background-color: rgba(12, 14, 24, 0.75) !important;
-        backdrop-filter: blur(10px);
-        border-right: 1px solid rgba(255, 255, 255, 0.15);
-    }
+def save_user_data_to_browser(data):
+    try:
+        local_storage.setItem("quiz_app_user_data", json.dumps(data, ensure_ascii=False))
+    except Exception:
+        st.warning("端末へのデータ保存に失敗しました。")
 
-    input, select, textarea {
-        color: #000000 !important;
-        -webkit-text-fill-color: #000000 !important;
-        text-shadow: none !important;
-        font-weight: bold !important;
-    }
+if "user_data" not in st.session_state:
+    st.session_state.user_data = load_user_data_from_browser()
 
-    button[kind="primary"] {
-        background-color: #00d2ff !important;
-        color: #000000 !important;
-        font-weight: bold !important;
-        border: none !important;
-        box-shadow: 0 0 15px rgba(0, 210, 255, 0.6) !important;
-        text-shadow: none !important;
-    }
-
-    div[data-testid="stDataFrame"] {
-        background-color: rgba(0, 0, 0, 0.6) !important;
-        border-radius: 8px;
-        backdrop-filter: blur(4px);
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-# --------------------------------------------------
-# Supabase 初期化
-# --------------------------------------------------
-@st.cache_resource
-def init_supabase() -> Client:
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["key"]
-    return create_client(url, key)
-
-try:
-    supabase = init_supabase()
-except Exception as e:
-    st.error("Supabaseへの接続に失敗しました。.streamlit/secrets.toml の設定を確認してください。")
-    st.stop()
-
-def safe_execute(query, retries=3, delay=0.3):
-    """通信エラーが発生してもクラッシュさせず、指定回数リトライする"""
-    for i in range(retries):
-        try:
-            return query.execute()
-        except Exception as e:
-            if i == retries - 1:
-                return None
-            time.sleep(delay)
+# --- 拡張子揺らぎ吸収・画像パス取得関数 ---
+def find_existing_image_path(*path_segments):
+    base_path = os.path.join(*path_segments)
+    if not base_path:
+        return None
+    if os.path.exists(base_path):
+        return base_path
+    
+    root, _ = os.path.splitext(base_path)
+    for ext in ['.jpg', '.JPG', '.jpeg', '.JPEG', '.png', '.PNG', '.webp', '.WEBP']:
+        alt_path = root + ext
+        if os.path.exists(alt_path):
+            return alt_path
     return None
 
-# --------------------------------------------------
-# クイズデータ読み込み
-# --------------------------------------------------
-@st.cache_data
-def get_raw_quiz_data():
-    csv_file = "questions.csv"
-    if os.path.exists(csv_file):
+# --- 安全な画像表示ユーティリティ ---
+def safe_render_image(image_path, width=None, use_container_width=False, caption=None):
+    if not image_path or not os.path.exists(image_path):
+        st.warning(f"※画像が見つかりません: {os.path.basename(image_path) if image_path else ''}")
+        return
+    try:
+        if width:
+            st.image(image_path, width=width, caption=caption)
+        else:
+            st.image(image_path, use_container_width=use_container_width, caption=caption)
+    except Exception:
+        st.warning(f"※画像読み込みエラー: {os.path.basename(image_path)}")
+
+# --- 全面背景画像CSS適用関数 ---
+def set_full_screen_background(image_filename):
+    image_path = find_existing_image_path(IMAGE_DIR, image_filename)
+    if image_path:
         try:
-            df = pd.read_csv(csv_file, encoding="utf-8")
-        except UnicodeDecodeError:
-            df = pd.read_csv(csv_file, encoding="shift-jis")
-            
-        if "id" in df.columns:
-            df["q_id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
-        else:
-            df["q_id"] = range(1, len(df) + 1)
-            
-        df["answer"] = df["answer"].astype(str).str.strip()
-        df["question"] = df["question"].astype(str).str.strip()
-        return df
+            with open(image_path, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode()
+            st.markdown(
+                f"""
+                <style>
+                .stApp {{
+                    background-image: url("data:image/jpeg;base64,{encoded_string}");
+                    background-size: cover;
+                    background-position: center;
+                    background-repeat: no-repeat;
+                    background-attachment: fixed;
+                }}
+                .stApp, .stApp p, .stApp h1, .stApp h2, .stApp h3, .stApp span, .stMarkdown, .stTextArea, .stSelectbox, div[data-testid="stMetricValue"] {{
+                    color: #000000 !important;
+                }}
+                .stMarkdown, .stTextArea, .stSelectbox, div[data-testid="stMetricValue"] {{
+                    background-color: rgba(255, 255, 255, 0.85) !important;
+                    padding: 8px;
+                    border-radius: 8px;
+                }}
+                .stButton > button {{
+                    background-color: #ffffff !important;
+                    color: #000000 !important;
+                    border: 2px solid #333333 !important;
+                    font-weight: bold !important;
+                    border-radius: 8px !important;
+                }}
+                .stButton > button:hover {{
+                    background-color: #f0f0f0 !important;
+                    color: #000000 !important;
+                    border-color: #000000 !important;
+                }}
+                div[data-testid="stAlert"] {{
+                    background-color: rgba(255, 255, 255, 0.95) !important;
+                    color: #000000 !important;
+                    font-weight: bold !important;
+                    font-size: 1.15rem !important;
+                    border: 2px solid #333333 !important;
+                    border-radius: 10px;
+                }}
+                div[data-testid="stAlert"] p {{
+                    color: #000000 !important;
+                    font-weight: bold !important;
+                }}
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+        except Exception:
+            pass
+
+# --- A. クイズCSVデータ読み込み関数 ---
+@st.cache_data
+def load_questions(filepath):
+    csv_path = os.path.join(BASE_DIR, filepath)
+    questions = []
+    if not os.path.exists(csv_path):
+        st.error(f"クイズデータが見つかりません: {filepath}")
+        return questions
+        
+    with open(csv_path, mode="r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if "id" in row and row["id"].strip():
+                questions.append(row)
+    return questions
+
+# --- B. 判定ロジック ---
+def judge_qa(user_input, correct_str):
+    answers = [ans.strip().lower() for ans in correct_str.split("/")]
+    return user_input.strip().lower() in answers
+
+def judge_essay_keywords(user_input, keywords_str):
+    if not keywords_str:
+        return True, []
+    and_groups = [group.strip() for group in keywords_str.split(",")]
+    missing_groups = []
+    for group in and_groups:
+        or_keywords = [kw.strip() for kw in group.split("|")]
+        if not any(kw in user_input for kw in or_keywords):
+            missing_groups.append(" または ".join(or_keywords))
+    return len(missing_groups) == 0, missing_groups
+
+def judge_essay_with_ollama(question, user_ans, model_ans, keywords, is_kw_ok, missing_kws):
+    kw_status = "【キーワード判定】: 必須キーワード条件をすべて満たしています。" if is_kw_ok else f"【キーワード判定】: 不足 -> {', '.join(missing_kws)}"
+    prompt = f"""
+あなたは採点補助AIです。以下の基準に従って採点してください。
+【問題】: {question}
+【模範解答】: {model_ans}
+【必須キーワード仕様】: {keywords}
+{kw_status}
+【ユーザーの回答】: {user_ans}
+
+【採点基準】:
+1. 必須キーワードがすべて含まれ、内容が概ね8割以上正しい場合は「判定：正解」としてください。
+2. それ以外は「判定：不正解」または「判定：おしい」としてください。
+
+【出力フォーマット】:
+1行目:「判定：正解」「判定：おしい」「判定：不正解」のいずれか
+2行目以降:「アドバイス：(簡潔な解説)」
+"""
+    try:
+        response = ollama.chat(model='qwen2.5', messages=[{'role': 'user', 'content': prompt}])
+        return response['message']['content']
+    except Exception as e:
+        return f"判定：エラー\nAI判定エラー: {e}"
+
+def calculate_combo_bonus(combo):
+    if combo >= 5:
+        return 5
+    elif combo >= 3:
+        return 3
+    elif combo >= 2:
+        return 1
+    return 0
+
+# --- C. メイン画面 & サイドバー表示 ---
+st.sidebar.title("🎮 メニュー")
+mode = st.sidebar.radio("モード選択", ["クイズに挑戦", "ショップ", "おもちゃ箱（キャラ保存・図鑑）"])
+
+with st.sidebar.expander("⚙️ 端末データの管理"):
+    if st.button("セーブデータを初期化"):
+        st.session_state.user_data = DEFAULT_USER_DATA.copy()
+        save_user_data_to_browser(st.session_state.user_data)
+        st.success("データを初期化しました。")
+        st.rerun()
+
+# --- モード1: クイズに挑戦 ---
+if mode == "クイズに挑戦":
+    set_full_screen_background(QUIZ_SHOP_BG)
+    st.title("⚔️ クイズ＆論述 チャレンジ")
+
+    all_questions = load_questions(QUESTIONS_CSV_PATH)
+    total_csv_count = len(all_questions)
+    
+    # コード上で設定された問題数（TOTAL_QUIZ_COUNT）を決定
+    if TOTAL_QUIZ_COUNT is not None and TOTAL_QUIZ_COUNT > 0:
+        session_quiz_count = min(TOTAL_QUIZ_COUNT, total_csv_count)
     else:
-        st.error(f"クイズファイル `{csv_file}` が見つかりません。")
-        st.stop()
+        session_quiz_count = total_csv_count
 
-df_raw_quiz = get_raw_quiz_data()
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🎮 ゲームスタート！", use_container_width=True, disabled=(total_csv_count == 0)):
+        selected_q = random.sample(all_questions, session_quiz_count)
+        st.session_state.quiz_list = selected_q
+        st.session_state.current_idx = 0
+        st.session_state.score = 0
+        st.session_state.combo = 0
+        st.session_state.mistakes = 0
+        st.session_state.loop_count = 1
+        st.session_state.game_over = False
+        st.session_state.answered = False
+        st.session_state.pt_saved = False
+        st.rerun()
 
-def check_is_correct(user_ans: str, raw_correct_ans: str) -> bool:
-    if not user_ans or not str(user_ans).strip():
-        return False
-    clean_user = str(user_ans).strip().lower()
-    answers = re.split(r'[/／]', str(raw_correct_ans))
-    valid_answers = [a.strip().lower() for a in answers if a.strip()]
-    return clean_user in valid_answers
+    if "quiz_list" in st.session_state and st.session_state.quiz_list:
+        if st.session_state.mistakes >= MAX_MISTAKES:
+            st.session_state.game_over = True
 
-def get_shuffled_questions(s_id: int, e_id: int, room_code: str):
-    sub_df = df_raw_quiz[(df_raw_quiz["q_id"] >= s_id) & (df_raw_quiz["q_id"] <= e_id)]
-    if sub_df.empty:
-        return []
-    seed_string = f"{room_code}_{s_id}_{e_id}"
-    seed_num = int(hashlib.md5(seed_string.encode('utf-8')).hexdigest(), 16) % (2**32)
-    return sub_df.sample(frac=1, random_state=seed_num)["q_id"].tolist()
+        if not st.session_state.game_over and st.session_state.current_idx >= len(st.session_state.quiz_list):
+            st.session_state.loop_count += 1
+            st.session_state.current_idx = 0
+            # 次の周回でも設定された問題数で再抽選
+            st.session_state.quiz_list = random.sample(all_questions, session_quiz_count)
+            st.toast(f"🎉 1周クリア！ {st.session_state.loop_count}周目に入ります！", icon="🔄")
 
-# --------------------------------------------------
-# キャラアイコン読み込み
-# --------------------------------------------------
-available_icons = {}
-valid_extensions = (".png", ".jpg", ".jpeg", ".webp")
-for filename in sorted(os.listdir(".")):
-    if filename.lower().endswith(valid_extensions) and not filename.lower().startswith("bg"):
-        display_name = os.path.splitext(filename)[0]
-        b64 = get_base64_image(filename)
-        ext = filename.split(".")[-1].lower()
-        if ext == "jpg":
-            ext = "jpeg"
-        available_icons[display_name] = f"data:image/{ext};base64,{b64}"
-
-if not available_icons:
-    available_icons = {"キャラ01": "🐶", "キャラ02": "🐱", "キャラ03": "🦊", "キャラ04": "🤖"}
-
-def render_icon_html(icon_value: str, size: int = 70) -> str:
-    if icon_value and str(icon_value).startswith("data:image"):
-        return f'<img src="{icon_value}" width="{size}" height="{size}" style="border-radius: 50%; vertical-align: middle; margin-right: 12px; border: 3px solid rgba(255,255,255,0.9); background-color: rgba(0,0,0,0.4); padding: 2px; filter: drop-shadow(0px 4px 8px rgba(0,0,0,0.8)); object-fit: contain;">'
-    return f'<span style="font-size: {size}px; vertical-align: middle; margin-right: 12px;">{icon_value if icon_value else "👤"}</span>'
-
-# --------------------------------------------------
-# サイドバー: 役割選択
-# --------------------------------------------------
-st.sidebar.title("🎮 クイズシステム")
-role = st.sidebar.radio("役割を選択してください", ["👤 プレイヤー（参加者）", "👑 オーナー（管理者）"])
-
-min_q_id = int(df_raw_quiz["q_id"].min())
-max_q_id = int(df_raw_quiz["q_id"].max())
-
-# --------------------------------------------------
-# オーナー（管理者）画面
-# --------------------------------------------------
-if role == "👑 オーナー（管理者）":
-    st.title("👑 オーナー管理画面")
-    
-    password = st.sidebar.text_input("管理者パスワード", type="password")
-    owner_pass = st.secrets.get("owner", {}).get("password", "admin")
-    
-    if password != owner_pass:
-        st.warning("正しいパスワードを入力してください。")
-        st.stop()
-        
-    st.success("管理者として認証されました。")
-    st.subheader("⚙️ ルームコントロール")
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        room_code = st.text_input("ルームコード", value="ROOM1")
-    with col2:
-        q_start = st.number_input("開始問題ID", min_value=min_q_id, max_value=max_q_id, value=min_q_id)
-    with col3:
-        q_end = st.number_input("終了問題ID", min_value=min_q_id, max_value=max_q_id, value=min_q_id + 9 if min_q_id + 9 <= max_q_id else max_q_id)
-        
-    btn_col1, btn_col2 = st.columns([2, 1])
-    with btn_col1:
-        if st.button("🚀 ルームを作成 / 初期化する（指定範囲でシャッフル）", type="primary"):
-            s_id = min(int(q_start), int(q_end))
-            e_id = max(int(q_start), int(q_end))
+        if not st.session_state.game_over:
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("周回数", f"{st.session_state.get('loop_count', 1)} 周目")
+            col2.metric("獲得Pt", f"{st.session_state.score} Pt")
+            col3.metric("コンボ", f"{st.session_state.combo} 連勝")
+            col4.metric("ライフ", "❤️" * (MAX_MISTAKES - st.session_state.mistakes))
             
-            res = safe_execute(supabase.table("rooms").select("room_code").eq("room_code", room_code))
-            existing_room = res.data if res else []
+            st.markdown("---")
+            idx = st.session_state.current_idx
+            current_q = st.session_state.quiz_list[idx]
             
-            room_payload = {
-                "room_code": room_code,
-                "status": "waiting",
-                "current_question_id": 0,
-                "q_start_id": s_id,
-                "q_end_id": e_id,
-                "question_start_time": 0
-            }
+            total_q_count = len(st.session_state.quiz_list)
+            st.subheader(f"第 {idx + 1} / {total_q_count} 問 (ID: {current_q['id']})")
+            st.info(current_q["question"])
+            user_ans = st.text_area("あなたの回答を入力してください", key=f"input_{st.session_state.loop_count}_{idx}")
             
-            if existing_room:
-                safe_execute(supabase.table("rooms").update(room_payload).eq("room_code", room_code))
-            else:
-                safe_execute(supabase.table("rooms").insert(room_payload))
-            
-            safe_execute(supabase.table("players").delete().eq("room_code", room_code))
-            
-            sub_q = get_shuffled_questions(s_id, e_id, room_code)
-            st.success(f"ルーム `{room_code}` を初期化しました！ 問題ID {s_id}〜{e_id} の全 {len(sub_q)} 問をシャッフルしました。")
-            st.rerun()
-
-    with btn_col2:
-        if st.button("🗑️ 参加者データのみクリア"):
-            safe_execute(supabase.table("players").delete().eq("room_code", room_code))
-            st.success("参加者データをクリアしました。")
-            st.rerun()
-        
-    st.divider()
-    
-    room_res = safe_execute(supabase.table("rooms").select("*").eq("room_code", room_code))
-    
-    if room_res and room_res.data:
-        room_data = room_res.data[0]
-        current_status = room_data.get("status", "waiting")
-        current_idx = int(room_data.get("current_question_id", 0) or 0)
-        q_start_time = float(room_data.get("question_start_time", 0) or 0)
-        
-        s_id = int(room_data.get("q_start_id", min_q_id) or min_q_id)
-        e_id = int(room_data.get("q_end_id", max_q_id) or max_q_id)
-        
-        question_order = get_shuffled_questions(s_id, e_id, room_code)
-        total_q = len(question_order)
-        
-        if total_q > 0 and current_idx < total_q:
-            real_q_id = question_order[current_idx]
-            q_row = df_raw_quiz[df_raw_quiz["q_id"] == real_q_id]
-            current_question = q_row.iloc[0]["question"] if not q_row.empty else ""
-            current_answer = q_row.iloc[0]["answer"] if not q_row.empty else ""
-        else:
-            real_q_id = "-"
-            current_question = "出題可能な問題がありません"
-            current_answer = ""
-        
-        st.markdown(f"**ステータス**: `{current_status}` | **進行状況**: {current_idx + 1} / {total_q} 問目 (出題中の問題ID: `{real_q_id}`)")
-        
-        if current_status == "waiting":
-            st.warning("⏳ 参加者待機中です。「📢 クイズを出題」を押すとプレイヤー画面に出題されます。")
-        elif current_status == "answer":
-            st.info(f"❓ **現在の問題 ({current_idx + 1}/{total_q}問目):**\n\n### {current_question}\n\n💡 **正解:** **【 {current_answer} 】**")
-        else:
-            elapsed = time.time() - q_start_time if q_start_time > 0 else 0
-            rem_time = max(0, int(TIME_LIMIT - elapsed))
-            st.info(f"❓ **現在の問題 ({current_idx + 1}/{total_q}問目):**\n\n### {current_question}\n\n⏱️ **残り時間:** `{rem_time}` 秒\n\n🔒 *(正解は「正答発表」を押すと表示されます)*")
-        
-        col_btn1, col_btn2, col_btn3 = st.columns(3)
-        with col_btn1:
-            if st.button("📢 クイズを出題（進行中）"):
-                safe_execute(supabase.table("players").update({"last_answer": ""}).eq("room_code", room_code))
-                safe_execute(supabase.table("rooms").update({
-                    "status": "question",
-                    "question_start_time": time.time()
-                }).eq("room_code", room_code))
-                st.rerun()
-                
-        with col_btn2:
-            if st.button("⭕ 正答発表"):
-                safe_execute(supabase.table("rooms").update({"status": "answer"}).eq("room_code", room_code))
-                st.rerun()
-                
-        with col_btn3:
-            if st.button("➡️ 次の問題へ"):
-                next_idx = current_idx + 1
-                if next_idx >= total_q:
-                    safe_execute(supabase.table("rooms").update({"status": "finished"}).eq("room_code", room_code))
-                else:
-                    safe_execute(supabase.table("players").update({"last_answer": ""}).eq("room_code", room_code))
-                    safe_execute(supabase.table("rooms").update({
-                        "status": "question",
-                        "current_question_id": next_idx,
-                        "question_start_time": time.time()
-                    }).eq("room_code", room_code))
-                st.rerun()
-                
-        if st.button("🏆 最終結果画面を表示"):
-            safe_execute(supabase.table("rooms").update({"status": "finished"}).eq("room_code", room_code))
-            st.rerun()
-            
-        st.divider()
-        st.subheader("📊 参加者一覧と回答リアルタイム状況")
-        
-        players_res = safe_execute(supabase.table("players").select("player_name, last_answer, score, combo").eq("room_code", room_code).order("score", desc=True))
-        if players_res and players_res.data:
-            df_players = pd.DataFrame(players_res.data)
-            
-            def judge_answer(ans):
-                if not ans or str(ans).strip() == "":
-                    return "-"
-                return "⭕ 正解" if check_is_correct(str(ans), current_answer) else "❌ 不正解"
-
-            df_players["判定"] = df_players["last_answer"].apply(judge_answer)
-            
-            df_display = df_players[["player_name", "last_answer", "判定", "score", "combo"]].rename(columns={
-                "player_name": "プレイヤー名",
-                "last_answer": "送信された回答",
-                "score": "現在のスコア",
-                "combo": "コンボ数"
-            })
-            
-            st.dataframe(df_display, use_container_width=True)
-        else:
-            st.info("現在参加者はいません。")
-    else:
-        st.warning("⚠️ データベースからの取得に失敗しました。自動再読込中...")
-            
-    time.sleep(1)
-    st.rerun()
-
-# --------------------------------------------------
-# プレイヤー（参加者）画面
-# --------------------------------------------------
-else:
-    st.title("👤 プレイヤースタンド")
-    
-    if "joined" not in st.session_state:
-        st.session_state.joined = False
-    if "player_name" not in st.session_state:
-        st.session_state.player_name = ""
-    if "room_code" not in st.session_state:
-        st.session_state.room_code = "ROOM1"
-    if "icon" not in st.session_state:
-        st.session_state.icon = list(available_icons.values())[0] if available_icons else "🐶"
-    if "last_processed_idx" not in st.session_state:
-        st.session_state.last_processed_idx = None
-    if "submitted" not in st.session_state:
-        st.session_state.submitted = False
-        
-    if not st.session_state.joined:
-        st.subheader("参加情報の入力")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.session_state.room_code = st.text_input("ルームコード", value=st.session_state.room_code)
-            st.session_state.player_name = st.text_input("プレイヤー名（必須）")
-        with c2:
-            selected_icon_key = st.selectbox("アイコンを選択", list(available_icons.keys()))
-            st.session_state.icon = available_icons.get(selected_icon_key, "🐶")
-            st.markdown(f"選択中: {render_icon_html(st.session_state.icon, 80)}", unsafe_allow_html=True)
-            
-        if st.button("🎮 参加する", type="primary"):
-            p_name = st.session_state.player_name.strip()
-            r_code = st.session_state.room_code.strip()
-            
-            if not p_name:
-                st.error("プレイヤー名を入力してください。")
-            else:
-                check_res = safe_execute(supabase.table("players").select("*").eq("room_code", r_code).eq("player_name", p_name))
-                
-                if check_res and check_res.data:
-                    safe_execute(supabase.table("players").update({
-                        "icon": st.session_state.icon
-                    }).eq("room_code", r_code).eq("player_name", p_name))
-                else:
-                    player_payload = {
-                        "room_code": r_code,
-                        "player_name": p_name,
-                        "icon": st.session_state.icon,
-                        "score": 0,
-                        "combo": 0,
-                        "last_answer": ""
-                    }
-                    safe_execute(supabase.table("players").insert(player_payload))
+            col_send, col_quit = st.columns([2, 1])
+            with col_send:
+                if st.button("回答を送信") and not st.session_state.get("answered", False):
+                    st.session_state.answered = True
+                    is_correct = False
                     
-                st.session_state.joined = True
-                st.rerun()
-    else:
-        room_code = st.session_state.room_code
-        room_res = safe_execute(supabase.table("rooms").select("*").eq("room_code", room_code))
-        
-        if not room_res or not room_res.data:
-            st.warning("⚠️ ルーム情報を取得中（または一時的な通信エラー）...")
-            time.sleep(1)
-            st.rerun()
-            
-        room_data = room_res.data[0]
-        status = room_data.get("status", "waiting")
-        current_idx = int(room_data.get("current_question_id", 0) or 0)
-        q_start_time = float(room_data.get("question_start_time", 0) or 0)
-        
-        s_id = int(room_data.get("q_start_id", min_q_id) or min_q_id)
-        e_id = int(room_data.get("q_end_id", max_q_id) or max_q_id)
-        
-        question_order = get_shuffled_questions(s_id, e_id, room_code)
-        
-        if st.session_state.last_processed_idx != current_idx:
-            st.session_state.last_processed_idx = current_idx
-            p_check = safe_execute(supabase.table("players").select("last_answer").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
-            if p_check and p_check.data and p_check.data[0].get("last_answer"):
-                st.session_state.submitted = True
-            else:
-                st.session_state.submitted = False
-        
-        icon_html = render_icon_html(st.session_state.icon, 64)
-        st.markdown(f"### {icon_html} **{st.session_state.player_name}** さんの画面 (ルーム: `{room_code}`)", unsafe_allow_html=True)
-        
-        if status == "waiting":
-            st.info("⏳ オーナーがクイズを開始するのを待っています...")
-            time.sleep(1)
-            st.rerun()
-            
-        elif status == "question":
-            if question_order and current_idx < len(question_order):
-                real_q_id = question_order[current_idx]
-                q_row = df_raw_quiz[df_raw_quiz["q_id"] == real_q_id]
-                
-                if not q_row.empty:
-                    q_text = q_row.iloc[0]["question"]
-                    correct_ans = str(q_row.iloc[0]["answer"]).strip()
-                    
-                    elapsed = time.time() - q_start_time if q_start_time > 0 else 0
-                    remaining = max(0, int(TIME_LIMIT - elapsed))
-                    is_time_up = (remaining <= 0)
-                    
-                    st.subheader(f"❓ 第 {current_idx + 1} 問")
-                    st.markdown(f"#### {q_text}")
-                    
-                    progress = float(remaining / TIME_LIMIT)
-                    st.progress(progress)
-                    
-                    if is_time_up:
-                        st.error("⏰ 制限時間終了（30秒経ちました）")
-                    else:
-                        st.warning(f"⏱️ 残り時間: **{remaining}** 秒")
-                    
-                    user_input = st.text_input(
-                        "回答を入力してください",
-                        key=f"input_{current_idx}",
-                        disabled=st.session_state.submitted or is_time_up
-                    )
-                    
-                    if not st.session_state.submitted and not is_time_up:
-                        if st.button("解答を送信", type="primary"):
-                            if not user_input.strip():
-                                st.error("回答を入力してください。")
-                            else:
-                                p_res = safe_execute(supabase.table("players").select("score, combo").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
-                                if p_res and p_res.data:
-                                    p_data = p_res.data[0]
-                                    current_score = p_data.get("score", 0) or 0
-                                    current_combo = p_data.get("combo", 0) or 0
-                                    
-                                    is_correct = check_is_correct(user_input, correct_ans)
-                                    
-                                    if is_correct:
-                                        new_combo = current_combo + 1
-                                        add_score = 100 + (new_combo - 1) * 20
-                                        new_score = current_score + add_score
-                                    else:
-                                        new_combo = 0
-                                        new_score = current_score
-                                        
-                                    safe_execute(supabase.table("players").update({
-                                        "score": new_score,
-                                        "combo": new_combo,
-                                        "last_answer": user_input.strip()
-                                    }).eq("room_code", room_code).eq("player_name", st.session_state.player_name))
-                                    
-                                    st.session_state.submitted = True
-                                    st.rerun()
-                    elif st.session_state.submitted:
-                        st.success("✅ 回答を送信しました！正答発表をお待ちください。")
-                    elif is_time_up:
-                        st.info("時間切れのため回答受付を終了しました。")
-            
-            time.sleep(1)
-            st.rerun()
-            
-        elif status == "answer":
-            if question_order and current_idx < len(question_order):
-                real_q_id = question_order[current_idx]
-                q_row = df_raw_quiz[df_raw_quiz["q_id"] == real_q_id]
-                
-                if not q_row.empty:
-                    correct_ans = q_row.iloc[0]["answer"]
-                    st.subheader(f"⭕ 第 {current_idx + 1} 問 の正解発表")
-                    st.success(f"正解は **【 {correct_ans} 】** でした！")
-                    
-                    p_res = safe_execute(supabase.table("players").select("score, combo, last_answer").eq("room_code", room_code).eq("player_name", st.session_state.player_name))
-                    if p_res and p_res.data:
-                        p = p_res.data[0]
-                        user_ans = p.get("last_answer", "")
-                        
-                        if check_is_correct(user_ans, correct_ans):
-                            st.balloons()
-                            st.markdown(f"🎉 **正解！** あなたの回答: `{user_ans}`")
+                    if current_q["type"] == "qa":
+                        if judge_qa(user_ans, current_q["answer"]):
+                            is_correct = True
                         else:
-                            st.markdown(f"❌ **不正解...** あなたの回答: `{user_ans if user_ans else '未回答'}`")
-                            
-                        st.markdown(f"現在のスコア: **{p.get('score', 0)} pt** | コンボ: **{p.get('combo', 0)}**")
+                            st.error("❌ 不正解")
+                            st.write(f"**模範解答**: {current_q['answer']}")
+                    elif current_q["type"] == "essay":
+                        is_kw_ok, missing_kws = judge_essay_keywords(user_ans, current_q["keywords"])
+                        with st.spinner("AI判定中..."):
+                            ai_feedback = judge_essay_with_ollama(
+                                current_q["question"], user_ans, current_q["answer"], 
+                                current_q["keywords"], is_kw_ok, missing_kws
+                            )
+                        if "判定：正解" in ai_feedback or "判定: 正解" in ai_feedback:
+                            is_correct = True
+                        else:
+                            st.error("❌ 不正解")
+                        st.write("**AIフィードバック**:")
+                        st.write(ai_feedback)
+                        st.info(f"**模範解答**: {current_q['answer']}")
+
+                    if is_correct:
+                        st.session_state.combo += 1
+                        bonus = calculate_combo_bonus(st.session_state.combo)
+                        earned = BASE_SCORE + bonus
+                        st.session_state.score += earned
+                        st.success(f"🎉 正解！ +{earned}Pt 獲得！")
+                    else:
+                        st.session_state.combo = 0
+                        st.session_state.mistakes += 1
+
+            with col_quit:
+                if st.button("🛑 途中でやめる（ポイント確定）"):
+                    st.session_state.game_over = True
+                    st.rerun()
+
+            if st.session_state.get("answered", False):
+                if st.button("次の問題へ"):
+                    st.session_state.current_idx += 1
+                    st.session_state.answered = False
+                    st.rerun()
+
+        else:
+            if st.session_state.mistakes < MAX_MISTAKES:
+                st.balloons()
+                st.header("🏆 チャレンジ終了！お疲れ様でした")
+            else:
+                st.snow()
+                st.header("💔 ゲームオーバー！結果発表")
             
-            time.sleep(1)
+            earned_pt = st.session_state.score
+            st.subheader(f"到達: {st.session_state.get('loop_count', 1)} 周目 / 獲得スコア: {earned_pt} Pt")
+            
+            if "pt_saved" not in st.session_state or not st.session_state.pt_saved:
+                st.session_state.user_data["wallet"] += earned_pt
+                save_user_data_to_browser(st.session_state.user_data)
+                st.session_state.pt_saved = True
+            
+            st.success(f"所持ポイントへ追加されました！（現在: {st.session_state.user_data['wallet']} Pt）")
+            if st.button("もう一度挑戦する"):
+                del st.session_state.quiz_list
+                st.session_state.pt_saved = False
+                st.rerun()
+
+# --- モード2: ショップ ---
+elif mode == "ショップ":
+    set_full_screen_background(QUIZ_SHOP_BG)
+    st.title("🛍️ パーツショップ")
+    
+    wallet = st.session_state.user_data["wallet"]
+    st.subheader(f"現在の所持ポイント: {wallet} Pt")
+    st.markdown("---")
+    
+    owned = st.session_state.user_data["owned_items"]
+
+    cat_labels = {
+        "head": "👑 あたま パーツ",
+        "body": "🥋 からだ パーツ",
+        "right_hand": "⚔️ みぎて パーツ",
+        "left_hand": "🛡️ ひだりて パーツ",
+        "right_leg": "🦵 みぎあし パーツ",
+        "left_leg": "🦵 ひだりあし パーツ"
+    }
+
+    for cat_key, items in SHOP_ITEMS.items():
+        if not items:
+            continue
+        
+        st.write(f"### **{cat_labels.get(cat_key, cat_key.upper())}**")
+        cols = st.columns(2)
+        for i, item in enumerate(items):
+            with cols[i % 2]:
+                is_owned = item["id"] in owned
+                char_label = ""
+                if "char_id" in item:
+                    c_info = next((c for c in CHARACTERS if c["id"] == item["char_id"]), None)
+                    if c_info:
+                        char_label = f"[{c_info['name']}] "
+                
+                part_img_path = find_existing_image_path(IMAGE_DIR, item["char_id"], item["file"])
+                safe_render_image(part_img_path, width=120)
+                
+                st.write(f"**{char_label}{item['name']}**")
+                st.write(f"価格: {item['price']} Pt")
+                if is_owned:
+                    st.success("購入済み")
+                else:
+                    if st.button(f"購入", key=f"buy_{item['id']}"):
+                        if wallet >= item["price"]:
+                            st.session_state.user_data["wallet"] -= item["price"]
+                            st.session_state.user_data["owned_items"].append(item["id"])
+                            save_user_data_to_browser(st.session_state.user_data)
+                            st.success(f"{item['name']} を購入しました！")
+                            st.rerun()
+                        else:
+                            st.error("ポイントが不足しています")
+
+# --- モード3: おもちゃ箱 ---
+elif mode == "おもちゃ箱（キャラ保存・図鑑）":
+    set_full_screen_background(COMPLETED_BG)
+    
+    st.title("🧸 おもちゃ箱（キャラ解放・図鑑）")
+    
+    selected_char_info = st.selectbox("完成させるキャラクターを選択", CHARACTERS, format_func=lambda x: x["name"])
+    target_char_id = selected_char_info["id"]
+    owned_ids = st.session_state.user_data["owned_items"]
+    
+    target_all_items = []
+    for cat_key, items in SHOP_ITEMS.items():
+        for item in items:
+            if item.get("char_id") == target_char_id:
+                target_all_items.append(item)
+
+    owned_target_items = [item for item in target_all_items if item["id"] in owned_ids]
+    
+    total_needed_count = len(target_all_items)
+    owned_count = len(owned_target_items)
+    
+    st.markdown("---")
+    
+    if total_needed_count > 0 and owned_count == total_needed_count:
+        char_name = st.text_input("キャラクターの登録名", value=selected_char_info["name"])
+        complete_img_path = find_existing_image_path(IMAGE_DIR, target_char_id, "complete.jpg")
+        
+        st.write("### 【完成イラスト】")
+        safe_render_image(complete_img_path, width=350, caption=f"完成カード: {char_name}")
+            
+        if st.button("この完成品を図鑑に保存！"):
+            new_char = {
+                "base_char": selected_char_info["name"],
+                "name": char_name,
+                "img_path": complete_img_path
+            }
+            st.session_state.user_data["completed_chars"].append(new_char)
+            save_user_data_to_browser(st.session_state.user_data)
+            st.success("図鑑に保存しました！")
             st.rerun()
             
-        elif status == "finished":
-            st.title("🏆 最終結果発表 🏆")
-            
-            players_res = safe_execute(supabase.table("players").select("icon, player_name, score, combo").eq("room_code", room_code).order("score", desc=True))
-            players_data = players_res.data if players_res else []
-            
-            if players_data:
-                for idx, player in enumerate(players_data, 1):
-                    rank_emoji = "🥇 1位" if idx == 1 else ("🥈 2位" if idx == 2 else ("🥉 3位" if idx == 3 else f"第 {idx} 位"))
-                    
-                    icon = player.get("icon", "")
-                    name = player.get("player_name", "名無し")
-                    score = player.get("score", 0)
-                    combo = player.get("combo", 0)
-                    
-                    p_icon_html = render_icon_html(icon, 80)
-                    st.markdown(f"### {rank_emoji} : {p_icon_html} **{name}** — `{score}` pt (最大コンボ: {combo})", unsafe_allow_html=True)
-                    st.divider()
-            else:
-                st.info("参加者がいません。")
-                
-            if st.button("最初に戻る"):
-                st.session_state.joined = False
-                st.session_state.submitted = False
-                st.session_state.last_processed_idx = None
-                st.rerun()
+    else:
+        st.warning(f"「{selected_char_info['name']}」のパーツがまだ揃っていません。（所持数: {owned_count} / {total_needed_count}）")
+
+    st.markdown("---")
+    st.subheader("📖 保存済みキャラクター図鑑")
+    chars = st.session_state.user_data["completed_chars"]
+    if chars:
+        cols = st.columns(3)
+        for idx, c in enumerate(chars):
+            with cols[idx % 3]:
+                st.write(f"**No.{idx + 1} {c['name']}**")
+                img_p = find_existing_image_path(c.get('img_path', ''))
+                safe_render_image(img_p, use_container_width=True)
+    else:
+        st.write("まだ保存されたキャラクターはありません。")
